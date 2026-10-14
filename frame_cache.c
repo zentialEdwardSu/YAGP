@@ -80,10 +80,16 @@ static uint64_t path_hash(const wchar_t *path)
     return h;
 }
 
-static bool cache_file(const wchar_t *dir, const wchar_t *path, wchar_t *out, size_t cap)
+/* One file per GIF path and colour key, so switching a key on and off (or
+ * back to an earlier one) reloads instead of rebuilding. The header still
+ * holds and checks the key; the name only has to be stable. */
+static bool cache_file(const wchar_t *dir, const wchar_t *path, const CacheHeader *h, wchar_t *out, size_t cap)
 {
-    return _snwprintf_s(out, cap, _TRUNCATE, L"%s\\%016llx.ygc", dir,
-                        (unsigned long long)path_hash(path)) > 0;
+    uint64_t hash = path_hash(path);
+    const uint32_t key[3] = {h->key_enabled, h->key_rgb, (uint32_t)h->key_tolerance};
+    const uint8_t *k = (const uint8_t *)key;
+    for (size_t i = 0; i < sizeof(key); ++i) hash = (hash ^ k[i]) * 1099511628211ull;
+    return _snwprintf_s(out, cap, _TRUNCATE, L"%s\\%016llx.ygc", dir, (unsigned long long)hash) > 0;
 }
 
 static bool file_identity(const wchar_t *path, uint64_t *size, uint64_t *mtime)
@@ -151,7 +157,9 @@ static bool load(const wchar_t *file, const CacheHeader *want, FrameCache *out)
 static void save(const wchar_t *dir, const wchar_t *file, const CacheHeader *h, const FrameCache *c)
 {
     wchar_t tmp[MAX_PATH * 2];
-    if (_snwprintf_s(tmp, MAX_PATH * 2, _TRUNCATE, L"%s.%lu.tmp", file, GetCurrentProcessId()) <= 0) return;
+    /* Process and thread in the name: builds may run on a worker thread. */
+    if (_snwprintf_s(tmp, MAX_PATH * 2, _TRUNCATE, L"%s.%lu.%lu.tmp", file, GetCurrentProcessId(),
+                     GetCurrentThreadId()) <= 0) return;
     SHCreateDirectoryExW(NULL, dir, NULL); /* Creates intermediate folders too. */
     HANDLE f = CreateFileW(tmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (f == INVALID_HANDLE_VALUE) return;
@@ -162,16 +170,21 @@ static void save(const wchar_t *dir, const wchar_t *file, const CacheHeader *h, 
     if (!ok || !MoveFileExW(tmp, file, MOVEFILE_REPLACE_EXISTING)) DeleteFileW(tmp);
 }
 
-/* Bounding box of bytes that differ between two premultiplied BGRA canvases. */
-static void diff_box(const uint8_t *a, const uint8_t *b, int w, int h, uint16_t box[4])
+/* Region {l, t, r, b} of a w-wide canvas; scans below only look inside it,
+ * because gif_stream reports which pixels a frame can have changed. */
+typedef struct Region { int l, t, r, b; } Region;
+
+/* Bounding box of pixels inside rg that differ between two premultiplied
+ * BGRA canvases (pixels outside rg must be equal). */
+static void diff_box(const uint8_t *a, const uint8_t *b, int w, Region rg, uint16_t box[4])
 {
-    int l = w, t = h, r = 0, btm = 0;
-    size_t stride = (size_t)w * 4;
-    for (int y = 0; y < h; ++y) {
+    int l = rg.r, t = rg.b, r = rg.l, btm = rg.t;
+    size_t stride = (size_t)w * 4, run = (size_t)(rg.r - rg.l) * 4;
+    for (int y = rg.t; y < rg.b; ++y) {
         const uint32_t *ra = (const uint32_t *)(a + (size_t)y * stride);
         const uint32_t *rb = (const uint32_t *)(b + (size_t)y * stride);
-        if (!memcmp(ra, rb, stride)) continue;
-        int x0 = 0, x1 = w;
+        if (!memcmp(ra + rg.l, rb + rg.l, run)) continue;
+        int x0 = rg.l, x1 = rg.r;
         while (ra[x0] == rb[x0]) ++x0;          /* Row differs, so both stop in range. */
         while (ra[x1 - 1] == rb[x1 - 1]) --x1;
         if (x0 < l) l = x0;
@@ -186,20 +199,29 @@ static void diff_box(const uint8_t *a, const uint8_t *b, int w, int h, uint16_t 
     box[3] = (uint16_t)btm;
 }
 
-/* Grows [*l, *r) x [*t, *b) to cover every pixel of the canvas with alpha != 0. */
-static void grow_opaque(const uint8_t *bgra, int w, int h, int *l, int *t, int *r, int *b)
+/* Grows [*l, *r) x [*t, *b) to cover every pixel in rg with alpha != 0. */
+static void grow_opaque(const uint8_t *bgra, int w, Region rg, int *l, int *t, int *r, int *b)
 {
-    for (int y = 0; y < h; ++y) {
+    for (int y = rg.t; y < rg.b; ++y) {
         const uint8_t *row = bgra + (size_t)y * (size_t)w * 4;
-        int x0 = 0;
-        while (x0 < w && !row[x0 * 4 + 3]) ++x0;
-        if (x0 == w) continue;
-        int x1 = w;
+        int x0 = rg.l;
+        while (x0 < rg.r && !row[x0 * 4 + 3]) ++x0;
+        if (x0 == rg.r) continue;
+        int x1 = rg.r;
         while (!row[(x1 - 1) * 4 + 3]) --x1; /* Stops at x0 at the latest. */
         if (x0 < *l) *l = x0;
         if (x1 > *r) *r = x1;
         if (y < *t) *t = y;
         if (y + 1 > *b) *b = y + 1;
+    }
+}
+
+static void copy_region(uint8_t *dst, const uint8_t *src, int w, Region rg)
+{
+    size_t stride = (size_t)w * 4, run = (size_t)(rg.r - rg.l) * 4;
+    for (int y = rg.t; y < rg.b; ++y) {
+        size_t at = (size_t)y * stride + (size_t)rg.l * 4;
+        memcpy(dst + at, src + at, run);
     }
 }
 
@@ -219,6 +241,7 @@ static bool build(const wchar_t *path, bool key_enabled, uint32_t key_rgb, int k
     bool ok = prev && first && out->dirty;
     int n = 0;
     int ol = g.width, ot = g.height, orr = 0, ob = 0;
+    const Region full = {0, 0, g.width, g.height};
     while (ok) {
         int status = gif_stream_next(&g);
         /* Matches playback: an error after at least one frame ends the loop. */
@@ -230,16 +253,29 @@ static bool build(const wchar_t *path, bool key_enabled, uint32_t key_rgb, int k
             if (!grown) { ok = false; break; }
             out->dirty = grown;
         }
-        grow_opaque(g.bgra, g.width, g.height, &ol, &ot, &orr, &ob);
-        if (n == 0) memcpy(first, g.bgra, canvas);
-        else diff_box(prev, g.bgra, g.width, g.height, out->dirty[n]);
-        memcpy(prev, g.bgra, canvas);
+        if (n == 0) {
+            grow_opaque(g.bgra, g.width, full, &ol, &ot, &orr, &ob);
+            memcpy(first, g.bgra, canvas);
+            memcpy(prev, g.bgra, canvas);
+        } else {
+            /* Outside g.changed this canvas equals prev (the previous frame),
+             * so diffing, the opaque scan and the copy only need that box:
+             * a small sprite on a big canvas costs its own size per frame. */
+            Region rg = {g.changed[0], g.changed[1], g.changed[2], g.changed[3]};
+            if (rg.l < rg.r && rg.t < rg.b) {
+                diff_box(prev, g.bgra, g.width, rg, out->dirty[n]);
+                grow_opaque(g.bgra, g.width, rg, &ol, &ot, &orr, &ob);
+                copy_region(prev, g.bgra, g.width, rg);
+            } else {
+                memset(out->dirty[n], 0, sizeof(out->dirty[n]));
+            }
+        }
         ++n;
     }
     if (ok && n == 0) ok = false;
     /* Wrap: playback restarts from a cleared canvas, so going from the last
      * frame to frame 0 changes exactly prev -> first. */
-    if (ok) diff_box(prev, first, g.width, g.height, out->dirty[0]);
+    if (ok) diff_box(prev, first, g.width, full, out->dirty[0]);
     if (ok) {
         out->width = g.width;
         out->height = g.height;
@@ -260,8 +296,8 @@ static bool build(const wchar_t *path, bool key_enabled, uint32_t key_rgb, int k
     return ok;
 }
 
-bool frame_cache_get(const wchar_t *path, bool key_enabled, uint32_t key_rgb, int key_tolerance,
-                     int width, int height, const wchar_t *dir, FrameCache *out)
+static bool get(const wchar_t *path, bool key_enabled, uint32_t key_rgb, int key_tolerance,
+                int width, int height, const wchar_t *dir, bool allow_build, FrameCache *out)
 {
     memset(out, 0, sizeof(*out));
     CacheHeader h;
@@ -276,9 +312,9 @@ bool frame_cache_get(const wchar_t *path, bool key_enabled, uint32_t key_rgb, in
 
     wchar_t file[MAX_PATH * 2];
     bool cacheable = dir && *dir && file_identity(path, &h.file_size, &h.file_mtime) &&
-                     cache_file(dir, path, file, MAX_PATH * 2);
+                     cache_file(dir, path, &h, file, MAX_PATH * 2);
     if (cacheable && load(file, &h, out)) return true;
-    if (!build(path, key_enabled, key_rgb, key_tolerance, out)) return false;
+    if (!allow_build || !build(path, key_enabled, key_rgb, key_tolerance, out)) return false;
     if (out->width != width || out->height != height) {
         frame_cache_free(out);
         return false;
@@ -289,4 +325,16 @@ bool frame_cache_get(const wchar_t *path, bool key_enabled, uint32_t key_rgb, in
         save(dir, file, &h, out);
     }
     return true;
+}
+
+bool frame_cache_get(const wchar_t *path, bool key_enabled, uint32_t key_rgb, int key_tolerance,
+                     int width, int height, const wchar_t *dir, FrameCache *out)
+{
+    return get(path, key_enabled, key_rgb, key_tolerance, width, height, dir, true, out);
+}
+
+bool frame_cache_load(const wchar_t *path, bool key_enabled, uint32_t key_rgb, int key_tolerance,
+                      int width, int height, const wchar_t *dir, FrameCache *out)
+{
+    return get(path, key_enabled, key_rgb, key_tolerance, width, height, dir, false, out);
 }

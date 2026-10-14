@@ -60,6 +60,7 @@ typedef struct Overlay {
     /* Precomputed per-frame change boxes (see frame_cache.h); NULL = full uploads. */
     uint16_t (*dirty)[4];
     int dirty_count;
+    struct CacheJob *cache_job; /* Build in progress on the worker thread, or NULL. */
     bool failed;          /* Decoder error; keeps showing the last good frame. */
     bool is_static;       /* Single-frame GIF: nothing to schedule. */
     int frame_index;      /* Frames decoded since the last rewind. */
@@ -73,6 +74,7 @@ typedef struct Overlay {
     bool scaling;         /* Scale dialog open: the script is suspended too. */
     bool flip_x;
     double pos_x, pos_y;  /* Sub-pixel position the script works with. */
+    int win_x, win_y;     /* Window's actual top-left, tracked from WM_WINDOWPOSCHANGED. */
     double vx, vy;        /* px/s over the last script tick, seen by other scripts. */
     int64_t next_tick, last_tick, tick_interval;
     int id;               /* yagp.id; unique for this run. */
@@ -83,6 +85,11 @@ typedef struct Overlay {
     bool has_override;
     char *name_u8;        /* overlay_name() as UTF-8, for other scripts' peer tables. */
 } Overlay;
+
+/* Posted to g_app.tray_hwnd by the frame-cache worker; lParam is the job,
+ * which the handler must pass to overlay_cache_ready. */
+#define WM_APP_CACHE_READY (WM_APP + 3)
+void overlay_cache_ready(void *job);
 
 bool overlay_register_class(HINSTANCE instance);
 /* use_position=false places the window centred on the primary work area. */

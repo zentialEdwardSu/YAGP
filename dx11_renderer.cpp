@@ -206,8 +206,8 @@ extern "C" bool render_surface_present(RenderSurface *s, const uint8_t *bgra)
 
 extern "C" bool render_surface_present_dirty(RenderSurface *s, const uint8_t *bgra, const RECT *dirty)
 {
-    if (!dirty || s->full_pending > 0) return render_surface_present(s, bgra);
     if (!s || !bgra || !s->backbuffer || s->dev->lost) return false;
+    if (!dirty || s->full_pending > 0) return render_surface_present(s, bgra);
     const RECT bounds = {0, 0, s->width, s->height};
     RECT d;
     IntersectRect(&d, dirty, &bounds);

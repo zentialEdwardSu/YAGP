@@ -137,6 +137,9 @@ end
 - `load`、`loadfile`、`dofile`、`require`、`collectgarbage` 和 `string.dump` 已被移除，也不接受预编译的字节码。
 - 每个脚本的 Lua 状态内存上限为 4 MB。
 - 单次调用超过约 1000 万条指令就会被终止，死循环卡不住 UI 线程，写在 `pcall` 里也一样。
+- 模式匹配（`string.find`/`match`/`gmatch`/`gsub`）在 C 里执行，指令数限制打断不了它，所以它有自己的工作量上限（每次调用约 2000 万步，见 `cmake/patch_lstrlib.cmake`）。回溯爆炸的模式会报 "pattern too complex"，而不是卡死。
+- `setmetatable` 拒绝带 `__gc` 的元表：Lua 执行终结器时会关闭钩子，死循环的终结器无法被终止。
+- 事件函数（`update`、`on_moved` 等）按 `_G` 的原始字段查找，每次调用脚本都在保护模式下进行。严格模式的 `_G` 元表可以正常使用，任何脚本错误都不会让进程崩溃。
 - `print` 输出到 `OutputDebugString`，可以用 DebugView 查看。
 
 ## 设计说明
@@ -146,8 +149,10 @@ end
 - 所有挂件共用一个 D3D11 设备和一个 DirectComposition 设备，每个挂件只占一个双缓冲的 flip 模型合成交换链。
 - D3D11 设备优先在 WARP（软件光栅器）上创建，失败才用硬件。GPU 在这里不做任何工作：帧在 CPU 上合成并拷进后缓冲区，合成和缩放由 DWM 完成。加载硬件的用户态驱动每个进程要多占 20–60 MB 私有内存（在 AMD 上测得），WARP 只要约 1 MB。交换链缓冲区照样作为普通合成表面交给 DWM。
 - 色键按调色板项计算（每帧最多比较 256 次），所以合成时每个像素仍然只查一次表。修改色键后会从第 0 帧重新解码，画布上已有的像素也会重新抠图。
-- 添加 GIF 时会同步解码一遍来建立缓存，内容是每一帧变化像素的外接矩形。
-  - 缓存存在 `%LOCALAPPDATA%\YAGP\cache\<hash>.ygc`，以文件大小、修改时间和色键为键，GIF 被修改后会自动重建。
+- 添加 GIF 时会解码一遍来建立缓存，内容是每一帧变化像素的外接矩形。
+  - 缓存存在 `%LOCALAPPDATA%\YAGP\cache\<hash>.ygc`（每个路径和色键一个文件），并校验文件大小、修改时间和色键，GIF 被修改后会自动重建。
+  - 已有的缓存文件在 UI 线程上直接读取；没有缓存时由一个低优先级的后台线程逐个建立，期间 GIF 已经以整帧上传的方式开始播放。
+  - 建立缓存时每帧只扫描它可能改变的区域（本帧矩形加上一帧的 disposal 区域），大画布上的小精灵每帧只花它自身大小的开销。
   - 播放时只上传变化的矩形，外加上一帧的矩形（因为 flip 模型的缓冲区是交替使用的），完全相同的帧直接跳过。
   - 实测在 WARP 下 `Present1` 的脏矩形开销比省下的还多，所以 Present 仍然是整帧。
   - 一个 480×360、40 帧的 GIF，缓存文件 22 KB。建立缓存的测试进程用时 21 ms，加载缓存的用时 8.5 ms（都包含进程启动时间）。
@@ -192,6 +197,14 @@ python tests/test_frame_cache.py out\Release\gif_dump.exe
 out\Release\script_test.exe
 ```
 
+没有 Windows 时，解码器、帧缓存和 Lua 宿主也可以在 Linux 上本地编译运行：`tests/posix` 提供了一个很小的 Win32 替身，在 UBSan 和保护页分配器下运行，并自带一个不依赖第三方库的 GIF 生成器和参考合成器：
+
+```sh
+make -C tests/posix check LUA_DIR=<lua-5.4.7> GIFLIB_DIR=<giflib-5.2.2>
+python3 tests/posix/gifgen.py diff <旧 gif_dump> <新 gif_dump>  # 输出逐字节一致
+python3 tests/posix/gifgen.py bench <gif_dump>...              # 冷缓存构建耗时
+```
+
 解码测试把合成后的帧和帧延时与 Pillow 的结果对比，覆盖 disposal 1/2/3、隔行扫描、用 `gif_stream_restart` 循环、色键，以及拒绝格式错误的十六进制颜色。它还会把每个用例解码到缩小的画布（一半、五分之一、奇数尺寸 37×29、1×1），与原尺寸参考帧按"取中心最近像素"采样的结果逐像素对比。
 
 `script_test` 用一个假窗口、一个假鼠标和一个假的双显示器布局（尺寸不同、上下错开，中间有空隙）运行 Lua 宿主。它检查：
@@ -204,6 +217,7 @@ out\Release\script_test.exe
 - 拔掉显示器后 GIF 会被拉回。
 - GIF 之间的接触：开始和结束事件（边贴边不算、被删除的 GIF 会结束接触、回调顺序确定），以及 `others`/`peer`/`overlaps` 接口。
 - 两个反弹 GIF 加一个静止障碍物跑 10 万个 tick：开启 `COLLIDE` 时从不重叠，关闭时会互相穿过；两个叠在一起生成的 GIF 会自动分开。
+- 任何脚本都不能让宿主崩溃或卡死：严格模式的 `_G`、内存用满的脚本、非字符串错误、回溯爆炸的模式、`__gc` 终结器、协程内超时。
 
 ## 已知限制
 

@@ -12,14 +12,57 @@
 #define GIF_MAX_PIXELS (2048u * 2048u)
 #define GIF_DEFAULT_DELAY_MS 100
 
+/* Copies from the mapped file. If the file lives on a network share or
+ * removable drive that goes away, touching the view raises
+ * EXCEPTION_IN_PAGE_ERROR: report a short read instead of crashing, so giflib
+ * sees a damaged GIF and playback stops on the last good frame. */
+static size_t copy_from_view(void *dst, const uint8_t *src, size_t n)
+{
+#ifdef _MSC_VER
+    __try {
+        memcpy(dst, src, n);
+    } __except (GetExceptionCode() == EXCEPTION_IN_PAGE_ERROR ? EXCEPTION_EXECUTE_HANDLER
+                                                               : EXCEPTION_CONTINUE_SEARCH) {
+        return 0;
+    }
+#else
+    memcpy(dst, src, n);
+#endif
+    return n;
+}
+
 static int gif_input(GifFileType *decoder, GifByteType *bytes, int n)
 {
     GifStream *g = (GifStream *)decoder->UserData;
     size_t left = g->size - g->pos;
     size_t count = (size_t)n < left ? (size_t)n : left;
-    memcpy(bytes, g->data + g->pos, count);
+    count = copy_from_view(bytes, g->data + g->pos, count);
     g->pos += count;
     return (int)count;
+}
+
+static void box_union(int dst[4], const int add[4])
+{
+    if (add[0] >= add[2] || add[1] >= add[3]) return;
+    if (dst[0] >= dst[2] || dst[1] >= dst[3]) {
+        memcpy(dst, add, 4 * sizeof(int));
+        return;
+    }
+    if (add[0] < dst[0]) dst[0] = add[0];
+    if (add[1] < dst[1]) dst[1] = add[1];
+    if (add[2] > dst[2]) dst[2] = add[2];
+    if (add[3] > dst[3]) dst[3] = add[3];
+}
+
+/* Copies the canvas box b (l, t, r, b) from src to dst; both are out_w wide. */
+static void copy_box(uint8_t *dst, const uint8_t *src, int out_w, const int b[4])
+{
+    if (b[0] >= b[2] || b[1] >= b[3]) return;
+    size_t stride = (size_t)out_w * 4, run = (size_t)(b[2] - b[0]) * 4;
+    for (int y = b[1]; y < b[3]; ++y) {
+        size_t at = (size_t)y * stride + (size_t)b[0] * 4;
+        memcpy(dst + at, src + at, run);
+    }
 }
 
 static void close_decoder(GifStream *g)
@@ -121,6 +164,7 @@ int gif_stream_set_output_size(GifStream *g, int out_w, int out_h)
     g->out_w = out_w;
     g->out_h = out_h;
     g->old_disposal = 0;
+    g->canvas_fresh = 1;
     return 0;
 }
 
@@ -178,6 +222,7 @@ int gif_stream_restart(GifStream *g)
     g->pending_disposal = 0;
     g->pending_transparent = -1;
     g->old_disposal = 0;
+    g->canvas_fresh = 1;
     return 0;
 }
 
@@ -186,7 +231,9 @@ int gif_stream_restart(GifStream *g)
 static void apply_old_disposal(GifStream *g)
 {
     if (g->old_disposal == 3 && g->backup) {
-        memcpy(g->bgra, g->backup, (size_t)g->out_w * (size_t)g->out_h * 4);
+        /* The previous frame only drew inside old_box, so restoring that box
+         * restores the whole canvas. */
+        copy_box(g->bgra, g->backup, g->out_w, g->old_box);
     } else if (g->old_disposal == 2 && g->old_box[0] < g->old_box[2]) {
         for (int oy = g->old_box[1]; oy < g->old_box[3]; ++oy) {
             size_t pos = ((size_t)oy * (size_t)g->out_w + (size_t)g->old_box[0]) * 4;
@@ -295,15 +342,27 @@ static int read_image(GifStream *g)
     g->img_ox0 = box[0];
     g->img_ox1 = box[2];
 
+    /* What this frame can change: its own rect, plus the rect the previous
+     * frame's disposal clears or restores. */
+    int changed[4];
+    memcpy(changed, box, sizeof(changed));
+    if (g->old_disposal == 2 || (g->old_disposal == 3 && g->backup)) box_union(changed, g->old_box);
+    if (g->canvas_fresh) {
+        changed[0] = changed[1] = 0;
+        changed[2] = g->out_w;
+        changed[3] = g->out_h;
+    }
+
     apply_old_disposal(g);
     if (g->pending_disposal == 3) {
-        size_t canvas = (size_t)g->out_w * (size_t)g->out_h * 4;
         if (!g->backup) {
-            g->backup = (uint8_t *)malloc(canvas);
+            g->backup = (uint8_t *)malloc((size_t)g->out_w * (size_t)g->out_h * 4);
             if (!g->backup) return -1;
         }
-        memcpy(g->backup, g->bgra, canvas);
+        copy_box(g->backup, g->bgra, g->out_w, box); /* Only the rect this frame draws in. */
     }
+    memcpy(g->changed, changed, sizeof(changed));
+    g->canvas_fresh = 0;
 
     if (d->Image.Interlace) {
         static const int starts[4] = {0, 4, 2, 1};

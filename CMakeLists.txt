@@ -56,10 +56,18 @@ FetchContent_MakeAvailable(lua)
 set(LUA_DIR ${lua_SOURCE_DIR}/src)
 set(LUA_CORE lapi lcode lctype ldebug ldo ldump lfunc lgc llex lmem lobject lopcodes
     lparser lstate lstring ltable ltm lundump lvm lzio
-    lauxlib lbaselib lcorolib lmathlib lstrlib ltablib lutf8lib)
+    lauxlib lbaselib lcorolib lmathlib ltablib lutf8lib)
 list(TRANSFORM LUA_CORE PREPEND ${LUA_DIR}/)
 list(TRANSFORM LUA_CORE APPEND .c)
-add_library(lua STATIC ${LUA_CORE})
+# lstrlib with a work limit on pattern matching, which the instruction-count
+# hook cannot interrupt (see cmake/patch_lstrlib.cmake).
+set(LSTRLIB_YAGP ${CMAKE_CURRENT_BINARY_DIR}/lstrlib_yagp.c)
+add_custom_command(OUTPUT ${LSTRLIB_YAGP}
+    COMMAND ${CMAKE_COMMAND} -DIN=${LUA_DIR}/lstrlib.c -DOUT=${LSTRLIB_YAGP}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_lstrlib.cmake
+    DEPENDS ${LUA_DIR}/lstrlib.c ${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_lstrlib.cmake
+    COMMENT "Patching lstrlib.c with the pattern-matching step limit")
+add_library(lua STATIC ${LUA_CORE} ${LSTRLIB_YAGP})
 target_include_directories(lua PUBLIC ${LUA_DIR})
 target_compile_definitions(lua PRIVATE _CRT_SECURE_NO_WARNINGS)
 target_compile_options(lua PRIVATE /W0)

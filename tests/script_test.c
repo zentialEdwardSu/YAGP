@@ -849,6 +849,153 @@ static void test_hitbox_presets(void)
     world_set(NULL, 0);
 }
 
+/* ---- robustness: nothing a script does may abort the host ------------------- */
+
+static double seconds_since(LARGE_INTEGER t0)
+{
+    LARGE_INTEGER t1, f;
+    QueryPerformanceCounter(&t1);
+    QueryPerformanceFrequency(&f);
+    return (double)(t1.QuadPart - t0.QuadPart) / (double)f.QuadPart;
+}
+
+static void test_robustness(void)
+{
+    wchar_t err[512];
+    FakeWin w = {100, 100, 50, 50, false, 0, 0};
+    ScriptPeer p = {.id = 2, .w = 1, .h = 1, .hw = 1, .hh = 1, .name = "peer.gif"};
+
+    /* Strict mode (_G.__index raises): missing handlers are skipped. This used to
+     * raise outside any protected call, which aborts the process. */
+    Script *s = load(&w, "setmetatable(_G, {__index = function(_, k) error('undefined global ' .. tostring(k), 2) end})\n", err);
+    CHECK(s, "strict load: %ls", err);
+    if (s) {
+        CHECK(!script_has_update(s), "strict: has_update without update");
+        CHECK(script_update(s, 0.016, err, 512), "strict update: %ls", err);
+        CHECK(script_event(s, "on_moved", err, 512), "strict on_moved: %ls", err);
+        CHECK(script_event(s, "on_screens_changed", err, 512), "strict on_screens_changed: %ls", err);
+        CHECK(script_event_peer(s, "on_collide", &p, err, 512), "strict on_collide: %ls", err);
+        script_destroy(s);
+    }
+    s = load(&w, "setmetatable(_G, {__index = function(_, k) error('undefined global ' .. k, 2) end})\n"
+                 "function update(dt) rawset(_G, 'ticks', (rawget(_G, 'ticks') or 0) + 1) end\n"
+                 "function on_collide(p) assert(p.id == 2) rawset(_G, 'hit', true) end\n"
+                 "function check() assert(ticks == 3 and hit) end\n", err);
+    CHECK(s, "strict with handlers: %ls", err);
+    if (s) {
+        CHECK(script_has_update(s), "strict: has_update with update");
+        for (int i = 0; i < 3; ++i) CHECK(script_update(s, 0.016, err, 512), "strict update %d: %ls", i, err);
+        CHECK(script_event_peer(s, "on_collide", &p, err, 512), "strict on_collide: %ls", err);
+        CHECK(script_event(s, "check", err, 512), "strict handlers did not run: %ls", err);
+        script_destroy(s);
+    }
+
+    /* The cached has_update follows a script defining and removing update. */
+    s = load(&w, "function on_moved() update = function() end end\n"
+                 "function on_screens_changed() update = nil end\n", err);
+    CHECK(s, "has_update script: %ls", err);
+    if (s) {
+        CHECK(!script_has_update(s), "has_update before");
+        CHECK(script_event(s, "on_moved", err, 512) && script_has_update(s), "has_update after define");
+        CHECK(script_event(s, "on_screens_changed", err, 512) && !script_has_update(s), "has_update after nil");
+        script_destroy(s);
+    }
+
+    /* At the memory cap every entry point fails or succeeds, but returns: even
+     * creating the name string of a handler it never mentioned can fail. */
+    s = load(&w, "function update() local t = {} for i = 1, 100 do t[i] = {i} end end\n"
+                 "hog = {}\n"
+                 "pcall(function() local i = 0 while true do i = i + 1 hog[i] = {i} end end)\n", err);
+    CHECK(s, "memory hog load: %ls", err);
+    if (s) {
+        int failed = 0;
+        for (int i = 0; i < 50; ++i) {
+            char name[48];
+            snprintf(name, sizeof(name), "on_never_interned_%d_xxxxxxxxxxxxxxxxxxxxxxxx", i);
+            failed += !script_update(s, 0.016, err, 512);
+            failed += !script_event(s, name, err, 512);
+            failed += !script_event_peer(s, name, &p, err, 512);
+        }
+        printf("     memory cap: %d of 150 calls reported an error, none aborted\n", failed);
+        script_destroy(s);
+    }
+
+    /* Non-string error values. */
+    s = load(&w, "function update() error(42) end\nfunction on_moved() error({}) end\n", err);
+    if (s) {
+        CHECK(!script_update(s, 0.016, err, 512) && wcscmp(err, L"42") == 0, "number error: %ls", err);
+        CHECK(!script_event(s, "on_moved", err, 512) && err[0], "table error empty");
+        script_destroy(s);
+    }
+
+    /* Long non-ASCII messages are cut at a character boundary, not garbled. */
+    s = load(&w, "function update() error(string.rep('\\u{4E2D}', 600), 0) end\n", err);
+    if (s) {
+        bool all = !script_update(s, 0.016, err, 512) && wcslen(err) == 511;
+        for (size_t i = 0; all && i < 511; ++i) all = err[i] == 0x4E2D;
+        CHECK(all, "long message: len %zu, first %04X", wcslen(err), (unsigned)err[0]);
+        script_destroy(s);
+    }
+
+    /* Backtracking patterns run in C, where the instruction budget never fires:
+     * the matcher's own step limit must stop them quickly. */
+    static const char *const slow[] = {
+        "return string.find(string.rep('a', 100000), '.-.-.-.-b')",
+        "return string.find(string.rep('(', 30000), '%b()')",
+        "return string.find(string.rep('a', 200000), '(.*)%1b')",
+        "for _ in string.gmatch(string.rep('a', 5000), '.-b') do end",
+        "return (string.gsub(string.rep('a', 20000), 'a.-b', ''))",
+    };
+    for (size_t i = 0; i < sizeof(slow) / sizeof(slow[0]); ++i) {
+        char src[256];
+        snprintf(src, sizeof(src), "function update() %s end", slow[i]);
+        s = load(&w, src, err);
+        if (!s) { CHECK(false, "pattern load %zu: %ls", i, err); continue; }
+        LARGE_INTEGER t0;
+        QueryPerformanceCounter(&t0);
+        bool ok = script_update(s, 0.016, err, 512);
+        double dt = seconds_since(t0);
+        CHECK(!ok && wcsstr(err, L"pattern too complex"),
+              "pattern %zu not stopped: %ls", i, ok ? L"(succeeded)" : err);
+        CHECK(dt < 2.0, "pattern %zu took %.2f s", i, dt);
+        printf("     pattern %zu stopped after %.0f ms\n", i, dt * 1000);
+        script_destroy(s);
+    }
+    /* ... while ordinary heavy string work still passes. */
+    s = load(&w, "local s = string.rep('ab ', 300000)\n"
+                 "local r, n = s:gsub('%w+', 'x') assert(n == 300000)\n"
+                 "local c = 0 for _ in s:gmatch('%a+') do c = c + 1 end assert(c == 300000)\n"
+                 "assert(s:find('ab $') == #s - 2)\n"
+                 "assert(('key = value'):match('^(%w+)%s*=%s*(%w+)$') == 'key')\n"
+                 "assert(('[[x]]'):find('%b[]') == 1)\n", err);
+    CHECK(s, "ordinary string work rejected: %ls", err);
+    script_destroy(s);
+
+    /* A budget overrun inside a coroutine leaves later calls their full budget
+     * (about 6M instructions here, under the 10M limit). */
+    s = load(&w, "co = coroutine.create(function() while true do pcall(function() while true do end end) coroutine.yield() end end)\n"
+                 "function update() if co then coroutine.resume(co) co = nil\n"
+                 "  else local x = 0 for i = 1, 3000000 do x = x + i end end end\n", err);
+    CHECK(s, "coroutine budget load: %ls", err);
+    if (s) {
+        script_update(s, 0.016, err, 512); /* Times out inside the coroutine. */
+        CHECK(script_update(s, 0.016, err, 512), "budget after a coroutine timeout: %ls", err);
+        script_destroy(s);
+    }
+
+    /* Finalizers run with hooks disabled, so an endless __gc would hang every
+     * collection (and lua_close): they are refused. Ordinary metatables work. */
+    s = load(&w, "setmetatable({}, {__gc = function() while true do end end})\n", err);
+    CHECK(!s && wcsstr(err, L"__gc"), "__gc metatable accepted: %ls", s ? L"(loaded)" : err);
+    script_destroy(s);
+    s = load(&w, "local mt = {__index = function() return 1 end}\n"
+                 "local t = setmetatable({}, mt) assert(getmetatable(t) == mt and t.x == 1)\n"
+                 "mt.__gc = function() while true do end end -- added later: never called by Lua\n"
+                 "t = nil\n", err);
+    CHECK(s, "plain setmetatable: %ls", err);
+    script_destroy(s);
+}
+
 int main(void)
 {
     /* 1920x1080 primary (40 px taskbar) and a 1280x1024 monitor to its right,
@@ -863,6 +1010,7 @@ int main(void)
     test_hitbox_mapping();
     test_hitbox_api();
     test_hitbox_presets();
+    test_robustness();
     if (s_failures) {
         printf("%d check(s) failed\n", s_failures);
         return 1;

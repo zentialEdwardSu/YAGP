@@ -199,6 +199,15 @@ end
 - Each script's Lua state is capped at 4 MB.
 - A single call is stopped after about 10 million instructions, so an endless
   loop cannot freeze the UI thread, even inside `pcall`.
+- Pattern matching (`string.find`/`match`/`gmatch`/`gsub`) runs in C, where
+  the instruction limit cannot interrupt it, so it has its own work limit
+  (about 20 million matcher steps per call; `cmake/patch_lstrlib.cmake`).
+  A backtracking pattern fails with "pattern too complex" instead of hanging.
+- `setmetatable` refuses metatables with `__gc`: Lua runs finalizers with
+  hooks disabled, so an endless one could not be stopped.
+- Handlers (`update`, `on_moved`, ...) are looked up as raw fields of `_G`, and
+  every call into the script is protected. A strict-mode `_G` metatable works,
+  and no script error can take the process down.
 - `print` goes to `OutputDebugString` (view it with DebugView).
 
 ## Design notes
@@ -222,10 +231,15 @@ end
 - The colour key is resolved per palette entry (at most 256 comparisons per
   frame), so compositing stays one table lookup per pixel. Changing the key
   re-decodes from frame 0 so pixels already on the canvas are re-keyed too.
-- When a GIF is added, it is decoded once, synchronously, to build a cache:
-  a per-frame bounding box of changed pixels. It is stored in
-  `%LOCALAPPDATA%\YAGP\cache\<hash>.ygc` and is keyed by file size,
-  modification time and colour key, so an edited GIF is rebuilt automatically.
+- When a GIF is added, it is decoded once to build a cache: a per-frame
+  bounding box of changed pixels. It is stored in
+  `%LOCALAPPDATA%\YAGP\cache\<hash>.ygc` (one file per path and colour key)
+  and is checked against file size, modification time and colour key, so an
+  edited GIF is rebuilt automatically. An existing cache file is read on the
+  UI thread; a missing one is built on a low-priority worker thread, one GIF at
+  a time, while the GIF already plays with full uploads. The build only scans
+  the area each frame can change (its rect plus the previous frame's
+  disposal), so a small sprite on a large canvas costs its own size per frame.
   Playback uploads only the changed box (plus the previous one, because
   flip-model buffers alternate), and skips identical frames entirely.
   `Present1` dirty rects were measured to cost more than they save under WARP,
@@ -305,6 +319,17 @@ python tests/test_frame_cache.py out\Release\gif_dump.exe
 out\Release\script_test.exe
 ```
 
+Without Windows, the decoder, frame cache and Lua host also build and run
+natively on Linux against a small Win32 stand-in (`tests/posix`), under UBSan
+and a guard-page allocator, with a dependency-free GIF generator and reference
+compositor:
+
+```sh
+make -C tests/posix check LUA_DIR=<lua-5.4.7> GIFLIB_DIR=<giflib-5.2.2>
+python3 tests/posix/gifgen.py diff <old gif_dump> <new gif_dump>  # byte-identical output
+python3 tests/posix/gifgen.py bench <gif_dump>...                 # cold cache build time
+```
+
 The decoder test compares composited frames and delays against Pillow,
 covering disposal 1/2/3, interlacing, looping via `gif_stream_restart`, colour
 keying, and rejection of malformed hex colours. It also decodes every case into
@@ -323,6 +348,9 @@ removed GIFs end their contacts, deterministic order), the peer API, and runs
 two bouncing GIFs plus a static obstacle for 100k ticks: with `COLLIDE` they
 never overlap, without it they pass through, and two GIFs spawned on top of
 each other push apart.
+It also checks that no script can abort or hang the host: strict-mode `_G`,
+a script at its memory cap, non-string errors, backtracking patterns, `__gc`
+finalizers, and a timeout inside a coroutine.
 
 ## Known limitations
 

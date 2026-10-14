@@ -57,7 +57,12 @@ typedef struct Script Script;
 Script *script_create(const ScriptHostOps *ops, void *ctx, const char *chunk, size_t len,
                       const char *chunkname, const char *name, int id, wchar_t *err, size_t err_cap);
 void script_destroy(Script *s);
-/* True if the script defines a global update(dt). */
+/* Handlers (update, on_moved, ...) are raw fields of the global table: a
+ * metatable on _G (e.g. a strict-mode __index) is never consulted, so a
+ * missing handler is simply skipped. Every call into Lua is protected: no
+ * script, however broken, can abort the process. */
+
+/* True if the script defines a global update(dt). Cached, so cheap. */
 bool script_has_update(Script *s);
 /* Calls update(dt). Returns false with a message on any error. */
 bool script_update(Script *s, double dt, wchar_t *err, size_t err_cap);

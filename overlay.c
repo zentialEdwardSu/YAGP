@@ -131,18 +131,138 @@ static void dirty_reset(Overlay *o)
     o->dirty_count = 0;
 }
 
-/* Load (or build and store) the precomputed per-frame dirty boxes. On failure
- * playback falls back to full-frame uploads. */
+/* ---- frame cache, built off the UI thread ---------------------------------
+ * Building decodes every frame once, which for a big GIF takes long enough to
+ * freeze every overlay. An existing cache file is still read synchronously
+ * (fast, and the hitbox is right from the first frame); a missing or stale one
+ * is built by a single low-priority worker thread, one GIF at a time so memory
+ * stays bounded. Until it arrives the overlay plays with full uploads and its
+ * whole window as hitbox, exactly as when no cache can be written. */
+
+typedef struct CacheJob {
+    struct CacheJob *next;    /* Worker queue. */
+    volatile LONG cancelled;  /* Superseded or overlay gone: skip the build. */
+    wchar_t *path;
+    bool key_enabled;
+    uint32_t key_rgb;
+    int key_tolerance;
+    int width, height;
+    wchar_t dir[MAX_PATH];
+    bool ok;
+    FrameCache cache;
+} CacheJob;
+
+static SRWLOCK s_job_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE s_job_ready = CONDITION_VARIABLE_INIT;
+static CacheJob *s_job_head, *s_job_tail;
+static HANDLE s_worker;
+
+static void job_free(CacheJob *j)
+{
+    if (!j) return;
+    frame_cache_free(&j->cache);
+    free(j->path);
+    free(j);
+}
+
+static DWORD WINAPI cache_worker(void *arg)
+{
+    (void)arg;
+    /* Lower CPU and I/O priority: animations on the UI thread come first. */
+    SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+    for (;;) {
+        AcquireSRWLockExclusive(&s_job_lock);
+        while (!s_job_head) SleepConditionVariableSRW(&s_job_ready, &s_job_lock, INFINITE, 0);
+        CacheJob *j = s_job_head;
+        s_job_head = j->next;
+        if (!s_job_head) s_job_tail = NULL;
+        ReleaseSRWLockExclusive(&s_job_lock);
+        if (!j->cancelled) {
+            j->ok = frame_cache_get(j->path, j->key_enabled, j->key_rgb, j->key_tolerance,
+                                    j->width, j->height, j->dir, &j->cache);
+        }
+        /* From here the UI thread owns the job (overlay_cache_ready). */
+        if (!PostMessageW(g_app.tray_hwnd, WM_APP_CACHE_READY, 0, (LPARAM)j)) job_free(j);
+    }
+}
+
+static bool submit_job(CacheJob *j)
+{
+    if (!s_worker) {
+        s_worker = CreateThread(NULL, 0, cache_worker, NULL, 0, NULL);
+        if (!s_worker) return false;
+    }
+    AcquireSRWLockExclusive(&s_job_lock);
+    if (s_job_tail) s_job_tail->next = j;
+    else s_job_head = j;
+    s_job_tail = j;
+    ReleaseSRWLockExclusive(&s_job_lock);
+    WakeConditionVariable(&s_job_ready);
+    return true;
+}
+
+static void cancel_cache_job(Overlay *o)
+{
+    if (!o->cache_job) return;
+    InterlockedExchange(&o->cache_job->cancelled, 1); /* Freed when its result arrives. */
+    o->cache_job = NULL;
+}
+
+static void adopt_frame_cache(Overlay *o, FrameCache *c)
+{
+    o->dirty = c->dirty; /* Ownership moves to the overlay. */
+    o->dirty_count = c->frame_count;
+    for (int i = 0; i < 4; ++i) o->opaque[i] = c->opaque[i];
+    c->dirty = NULL;
+}
+
+/* Load (or have the worker build and store) the per-frame dirty boxes. On
+ * failure playback falls back to full-frame uploads. */
 static void load_frame_cache(Overlay *o)
 {
     FrameCache c;
     dirty_reset(o);
     memset(o->opaque, 0, sizeof(o->opaque)); /* Unknown: the whole window counts. */
-    if (!frame_cache_get(o->path, o->key_enabled, o->key_rgb, o->key_tolerance,
-                         o->gif->width, o->gif->height, g_app.cache_dir, &c)) return;
-    o->dirty = c.dirty; /* Ownership moves to the overlay. */
-    o->dirty_count = c.frame_count;
-    for (int i = 0; i < 4; ++i) o->opaque[i] = c.opaque[i];
+    cancel_cache_job(o);
+    if (frame_cache_load(o->path, o->key_enabled, o->key_rgb, o->key_tolerance,
+                         o->gif->width, o->gif->height, g_app.cache_dir, &c)) {
+        adopt_frame_cache(o, &c);
+        return;
+    }
+    CacheJob *j = (CacheJob *)calloc(1, sizeof(CacheJob));
+    if (j) {
+        j->path = dup_wcs(o->path);
+        j->key_enabled = o->key_enabled;
+        j->key_rgb = o->key_rgb;
+        j->key_tolerance = o->key_tolerance;
+        j->width = o->gif->width;
+        j->height = o->gif->height;
+        wcsncpy_s(j->dir, MAX_PATH, g_app.cache_dir, _TRUNCATE);
+        if (j->path && submit_job(j)) {
+            o->cache_job = j;
+            return;
+        }
+        job_free(j);
+    }
+    /* No worker thread: build here, as before. */
+    if (frame_cache_get(o->path, o->key_enabled, o->key_rgb, o->key_tolerance,
+                        o->gif->width, o->gif->height, g_app.cache_dir, &c)) {
+        adopt_frame_cache(o, &c);
+    }
+}
+
+void overlay_cache_ready(void *job)
+{
+    CacheJob *j = (CacheJob *)job;
+    for (Overlay *o = g_app.overlays; o; o = o->next) {
+        if (o->cache_job != j) continue;
+        o->cache_job = NULL;
+        if (j->ok && j->cache.width == o->gif->width && j->cache.height == o->gif->height) {
+            adopt_frame_cache(o, &j->cache);
+        }
+        break;
+    }
+    job_free(j);
 }
 
 static POINT window_center(const Overlay *o)
@@ -282,9 +402,9 @@ static void host_set_pos(void *ctx, double x, double y)
     o->pos_x = x;
     o->pos_y = y;
     int ix = (int)(x < 0 ? x - 0.5 : x + 0.5), iy = (int)(y < 0 ? y - 0.5 : y + 0.5);
-    RECT r;
-    GetWindowRect(o->hwnd, &r);
-    if (r.left == ix && r.top == iy) return;
+    /* Sub-pixel steps often round to where the window already is. win_x/win_y
+     * follow every move (ours or not), so no GetWindowRect per tick. */
+    if (o->win_x == ix && o->win_y == iy) return;
     /* No app_changed(): the position is read back when the config is saved.
      * Lean flags measured ~30% cheaper per move: we never handle
      * WM_WINDOWPOSCHANGING, and DirectComposition content needs no redraw/copy. */
@@ -413,6 +533,8 @@ static void sync_pos(Overlay *o)
     GetWindowRect(o->hwnd, &r);
     o->pos_x = r.left;
     o->pos_y = r.top;
+    o->win_x = r.left;
+    o->win_y = r.top;
 }
 
 /* Stops the script (window stays where it is) and tells the user why. */
@@ -650,6 +772,14 @@ static LRESULT CALLBACK overlay_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         app_changed();
         break;
+    case WM_WINDOWPOSCHANGED: {
+        const WINDOWPOS *wpos = (const WINDOWPOS *)lp;
+        if (o && !(wpos->flags & SWP_NOMOVE)) {
+            o->win_x = wpos->x;
+            o->win_y = wpos->y;
+        }
+        break; /* DefWindowProc still sends WM_MOVE / WM_SIZE. */
+    }
     case WM_DPICHANGED:
         return 0; /* GIF pixels stay 1:1 with device pixels; keep our size. */
     case WM_ERASEBKGND:
@@ -733,6 +863,7 @@ void overlay_destroy(Overlay *o)
         SetWindowLongPtrW(o->hwnd, GWLP_USERDATA, 0);
         DestroyWindow(o->hwnd);
     }
+    cancel_cache_job(o);
     free_gif(o->gif);
     dirty_reset(o);
     free(o->path);
@@ -859,15 +990,17 @@ static bool corner_color(const Overlay *o, uint32_t *rgb)
 }
 
 typedef struct ScalePreview {
-    Overlay *o;
+    int id;       /* Not a pointer: the overlay can be removed while the dialog is open. */
     POINT anchor; /* Fixed centre: re-deriving it each step would drift by rounding. */
 } ScalePreview;
 
 static void preview_scale(int pct, void *ctx)
 {
     ScalePreview *sp = (ScalePreview *)ctx;
-    sp->o->scale_pct = valid_scale(pct);
-    apply_size_at(sp->o, sp->anchor);
+    Overlay *o = find_overlay(sp->id);
+    if (!o) return;
+    o->scale_pct = valid_scale(pct);
+    apply_size_at(o, sp->anchor);
 }
 
 void overlay_command(Overlay *o, UINT cmd)
@@ -911,8 +1044,11 @@ void overlay_command(Overlay *o, UINT cmd)
     case OVERLAY_CMD_COLOR_KEY: {
         uint32_t rgb = o->key_rgb;
         int tol = o->key_tolerance;
+        int id = o->id;
         if (!o->key_enabled && !corner_color(o, &rgb)) rgb = 0x00FF00;
-        if (!app_prompt_color_key(&rgb, &tol)) return;
+        bool ok = app_prompt_color_key(&rgb, &tol);
+        o = find_overlay(id); /* Removed while the dialog was open? (nested message loop) */
+        if (!ok || !o) return;
         o->key_enabled = true;
         o->key_rgb = rgb;
         o->key_tolerance = tol;
@@ -938,11 +1074,15 @@ void overlay_command(Overlay *o, UINT cmd)
          *   the final result instead of stretching a small canvas (which makes
          *   nearest-neighbour columns double up and shimmer as the slider moves).
          * The scaled canvas is rebuilt once when the dialog closes. */
-        ScalePreview sp = {o, window_center(o)};
+        ScalePreview sp = {o->id, window_center(o)};
         int pct = o->scale_pct;
         o->scaling = true;
         apply_canvas_for(o, 100);
         bool ok = app_prompt_scale(&pct, preview_scale, &sp);
+        /* The dialog runs a nested message loop in which the overlay's own menu
+         * and the tray menu stay usable: it may have been removed meanwhile. */
+        o = find_overlay(sp.id);
+        if (!o) return;
         if (ok) preview_scale(pct, &sp); /* On cancel the preview is already reverted. */
         apply_canvas_for(o, o->scale_pct);
         o->scaling = false;
