@@ -16,7 +16,7 @@ typedef struct GifStream {
     /* Canvas size: width x height, or smaller (gif_stream_set_output_size). */
     int out_w, out_h;
     uint8_t *bgra;         /* out_w x out_h premultiplied BGRA; GIF alpha is only 0 or 255. */
-    uint8_t *backup;       /* Allocated lazily for disposal method 3. */
+    uint8_t *backup;       /* Disposal 3: canvas-sized, only the frame's rect is used. Lazy. */
     uint8_t *scanline;
     int *xmap;             /* out_w: source column sampled by each canvas column. */
     int *ymap;             /* out_h: source row sampled by each canvas row. */
@@ -27,6 +27,11 @@ typedef struct GifStream {
     int pending_transparent;
     int old_disposal;
     int old_box[4];        /* Previous frame's rect in canvas coordinates. */
+    /* Canvas box {l, t, r, b} that the last gif_stream_next may have changed
+     * (the frame's rect plus the previous frame's disposal); every pixel
+     * outside it is unchanged. The whole canvas after open/restart/resize. */
+    int changed[4];
+    int canvas_fresh;      /* Canvas was (re)created or cleared since the last frame. */
     int delay_ms;
     /* Colour key: palette entries within key_tolerance (per channel) of
      * key_rgb (0xRRGGBB) are composited as fully transparent. */

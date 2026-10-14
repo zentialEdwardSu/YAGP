@@ -15,6 +15,8 @@ typedef struct ContactBox {
 typedef struct Contacts {
     uint64_t *pairs;        /* Sorted keys (lo id << 32 | hi id) overlapping last time. */
     int n, cap;
+    uint64_t *spare;        /* Reused for the next update's set (swapped with pairs). */
+    int spare_cap;
 } Contacts;
 
 /* begin = true: a and b started overlapping; false: they stopped (or one of

@@ -78,6 +78,7 @@
 #define TXT_ERR_OPEN_GIF           L"Cannot open GIF:\n%s"
 #define TXT_ERR_SWAPCHAIN          L"Cannot create a swap chain for this GIF:\n%s"
 #define TXT_ERR_PICKER             L"Cannot start the file picker:\n%s"
+#define TXT_ERR_TOO_MANY_FILES     L"Too many files selected at once. Please add them in smaller batches."
 #define TXT_ERR_AUTOSTART          L"Cannot change the startup setting (%s)."
 #define TXT_ERR_DELETE_CONFIG      L"Cannot delete the settings folder:\n%s"
 #define TXT_ERR_DELETE_AUTOSTART   L"Cannot delete the startup entry:\n%s"
@@ -113,6 +114,7 @@
 #define TXT_U8_COORD_RANGE         "coordinate out of range"
 #define TXT_U8_OUT_OF_MEMORY       "out of memory"
 #define TXT_U8_LUA_STATE           "cannot create a Lua state"
+#define TXT_U8_NO_GC               "__gc metamethods are not allowed (finalizers cannot be interrupted)"
 
 #else /* zh_CN (default) */
 
@@ -178,6 +180,7 @@
 #define TXT_ERR_OPEN_GIF           L"无法打开 GIF：\n%s"
 #define TXT_ERR_SWAPCHAIN          L"无法为该 GIF 创建交换链：\n%s"
 #define TXT_ERR_PICKER             L"无法启动文件选择器：\n%s"
+#define TXT_ERR_TOO_MANY_FILES     L"一次选择的文件过多，请分批添加。"
 #define TXT_ERR_AUTOSTART          L"无法修改开机自启动设置（%s）。"
 #define TXT_ERR_DELETE_CONFIG      L"无法删除配置目录：\n%s"
 #define TXT_ERR_DELETE_AUTOSTART   L"无法删除开机自启动项：\n%s"
@@ -213,6 +216,7 @@
 #define TXT_U8_COORD_RANGE         "坐标超出范围"
 #define TXT_U8_OUT_OF_MEMORY       "内存不足"
 #define TXT_U8_LUA_STATE           "无法创建 Lua 状态"
+#define TXT_U8_NO_GC               "不允许使用 __gc 元方法（终结器无法被中断）"
 
 #endif
 

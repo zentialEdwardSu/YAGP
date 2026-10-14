@@ -27,6 +27,12 @@ typedef struct FrameCache {
  * check. Returns false if the GIF cannot be decoded. */
 bool frame_cache_get(const wchar_t *path, bool key_enabled, uint32_t key_rgb, int key_tolerance,
                      int width, int height, const wchar_t *dir, FrameCache *out);
+/* Same, but only reads an existing cache file (fast); false if there is none
+ * or it is stale. For the UI thread, before handing the build to a worker. */
+bool frame_cache_load(const wchar_t *path, bool key_enabled, uint32_t key_rgb, int key_tolerance,
+                      int width, int height, const wchar_t *dir, FrameCache *out);
+/* Both are thread-safe: they share no state, and may run concurrently with
+ * playback of the same file (each opens its own view). */
 void frame_cache_free(FrameCache *c);
 
 /* %LOCALAPPDATA%\YAGP\cache */

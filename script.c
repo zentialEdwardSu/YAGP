@@ -24,6 +24,10 @@ struct Script {
     int hooks_left;
     ScriptMouse mouse;   /* Last successfully read cursor state. */
     int id;
+    /* Whether the global table holds an update function, refreshed after every
+     * call into Lua (the only time it can change). The host asks for it many
+     * times per tick, once per overlay and peer. */
+    bool has_update;
     char name[128];
 };
 
@@ -65,20 +69,36 @@ static void to_wide(const char *utf8, wchar_t *out, size_t cap)
     if (!out || !cap) return;
     out[0] = 0;
     if (!utf8) return;
-    int n = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, out, (int)cap);
-    if (n <= 0) {
-        /* Too long or not UTF-8: keep what fits, byte by byte as Latin-1. */
-        size_t i = 0;
-        for (; utf8[i] && i + 1 < cap; ++i) out[i] = (wchar_t)(unsigned char)utf8[i];
-        out[i] = 0;
+    if (MultiByteToWideChar(CP_UTF8, 0, utf8, -1, out, (int)cap) > 0) return;
+    /* Longer than out: convert in full, then cut at a character boundary (not
+     * byte-wise, which would garble every non-ASCII message, e.g. zh_CN). */
+    int n = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, NULL, 0);
+    wchar_t *full = n > 0 ? (wchar_t *)malloc((size_t)n * sizeof(wchar_t)) : NULL;
+    if (full && MultiByteToWideChar(CP_UTF8, 0, utf8, -1, full, n) > 0) {
+        size_t keep = cap - 1;
+        if (keep > 0 && full[keep - 1] >= 0xD800 && full[keep - 1] <= 0xDBFF) --keep; /* Lone high surrogate. */
+        memcpy(out, full, keep * sizeof(wchar_t));
+        out[keep] = 0;
     }
+    free(full);
 }
 
+/* Pops the error value. Never allocates inside Lua: this runs outside any
+ * protected call, where a memory error would abort the process (lua_tostring
+ * on a number would create a string). */
 static void take_error(Script *s, wchar_t *err, size_t cap)
 {
-    const char *msg = lua_tostring(s->L, -1);
-    to_wide(msg ? msg : TXT_U8_NON_STRING_ERROR, err, cap);
-    lua_pop(s->L, 1);
+    lua_State *L = s->L;
+    if (lua_type(L, -1) == LUA_TSTRING) {
+        to_wide(lua_tostring(L, -1), err, cap);
+    } else if (lua_type(L, -1) == LUA_TNUMBER) {
+        char num[64];
+        _snprintf_s(num, sizeof(num), _TRUNCATE, "%.14g", (double)lua_tonumber(L, -1));
+        to_wide(num, err, cap);
+    } else {
+        to_wide(TXT_U8_NON_STRING_ERROR, err, cap);
+    }
+    lua_pop(L, 1);
 }
 
 /* Runs the function on top of the stack with nargs arguments under the budget. */
@@ -496,7 +516,85 @@ static const luaL_Reg yagp_lib[] = {
     {NULL, NULL}
 };
 
+/* ---- calls into the script ------------------------------------------------ */
+
+enum { CALL_PLAIN, CALL_DT, CALL_PEER, CALL_CHUNK };
+
+typedef struct Call {
+    Script *s;
+    const char *fn;          /* Global to call (not for CALL_CHUNK). */
+    int kind;
+    double dt;               /* CALL_DT */
+    const ScriptPeer *peer;  /* CALL_PEER */
+} Call;
+
+/* Pushes the global `name` without metamethods. A strict-mode script
+ * (setmetatable(_G, {__index = error})) must not have its missing on_moved
+ * turned into an error, and the host never runs script code just to look a
+ * handler up. May allocate the key string, so only call it under lua_pcall. */
+static int raw_global(lua_State *L, const char *name)
+{
+    lua_pushglobaltable(L);
+    lua_pushstring(L, name);
+    int type = lua_rawget(L, -2);
+    lua_remove(L, -2);
+    return type;
+}
+
+/* Every entry from the host runs through here, under protected_call, so no
+ * Lua error (script error, memory cap, budget) can escape to an unprotected
+ * frame, where Lua would abort the process. Stack: [call, chunk?]. */
+static int dispatch(lua_State *L)
+{
+    Call *c = (Call *)lua_touserdata(L, 1);
+    if (c->kind == CALL_CHUNK) {
+        lua_pushvalue(L, 2);
+        lua_call(L, 0, 0);
+    } else if (raw_global(L, c->fn) == LUA_TFUNCTION) {
+        int nargs = 0;
+        if (c->kind == CALL_DT) {
+            lua_pushnumber(L, c->dt);
+            nargs = 1;
+        } else if (c->kind == CALL_PEER) {
+            push_peer(L, c->peer);
+            nargs = 1;
+        }
+        lua_call(L, nargs, 0);
+    }
+    lua_settop(L, 0);
+    c->s->has_update = raw_global(L, "update") == LUA_TFUNCTION;
+    return 0;
+}
+
+/* Calls the global fn (if it is a function) with the arguments kind implies. */
+static bool call_global(Script *s, int kind, const char *fn, double dt, const ScriptPeer *peer,
+                        wchar_t *err, size_t err_cap)
+{
+    Call c = {s, fn, kind, dt, peer};
+    lua_pushcfunction(s->L, dispatch);   /* A light C function: no allocation. */
+    lua_pushlightuserdata(s->L, &c);
+    return protected_call(s, 1, err, err_cap);
+}
+
 /* ---- state setup --------------------------------------------------------- */
+
+/* setmetatable without finalizers. Lua runs __gc with debug hooks disabled
+ * (during any collection, and in lua_close), so an endless finalizer would
+ * freeze the UI thread for good. An object is only marked for finalization if
+ * its metatable has __gc when setmetatable is called, so checking here is
+ * enough; debug.setmetatable does not exist in this binary. */
+static int l_setmetatable(lua_State *L)
+{
+    if (lua_type(L, 2) == LUA_TTABLE) {
+        lua_pushliteral(L, "__gc");
+        if (lua_rawget(L, 2) != LUA_TNIL) return luaL_error(L, TXT_U8_NO_GC);
+        lua_pop(L, 1);
+    }
+    lua_pushvalue(L, lua_upvalueindex(1)); /* The base library's setmetatable. */
+    lua_insert(L, 1);
+    lua_call(L, lua_gettop(L) - 1, 1);
+    return 1;
+}
 
 /* Only these libraries are compiled in at all (see CMakeLists.txt); io, os,
  * package and debug do not exist in this binary. */
@@ -522,6 +620,9 @@ static int open_sandbox(lua_State *L)
     lua_pop(L, 1);
     lua_pushcfunction(L, l_print);
     lua_setglobal(L, "print");
+    lua_getglobal(L, "setmetatable");
+    lua_pushcclosure(L, l_setmetatable, 1);
+    lua_setglobal(L, "setmetatable");
 
     LARGE_INTEGER t;
     QueryPerformanceCounter(&t);
@@ -571,7 +672,13 @@ Script *script_create(const ScriptHostOps *ops, void *ctx, const char *chunk, si
         take_error(s, err, err_cap);
         goto fail;
     }
-    if (!protected_call(s, 0, err, err_cap)) goto fail;
+    /* [chunk] -> [dispatch, call, chunk]: inserting values does not allocate. */
+    Call run = {s, NULL, CALL_CHUNK, 0, NULL};
+    lua_pushcfunction(s->L, dispatch);
+    lua_insert(s->L, -2);
+    lua_pushlightuserdata(s->L, &run);
+    lua_insert(s->L, -2);
+    if (!protected_call(s, 2, err, err_cap)) goto fail;
     return s;
 
 fail:
@@ -582,56 +689,27 @@ fail:
 void script_destroy(Script *s)
 {
     if (!s) return;
-    if (s->L) lua_close(s->L);
+    if (s->L) lua_close(s->L); /* No script finalizers can exist: see l_setmetatable. */
     free(s);
 }
 
 bool script_has_update(Script *s)
 {
-    if (!s) return false;
-    bool fn = lua_getglobal(s->L, "update") == LUA_TFUNCTION;
-    lua_pop(s->L, 1);
-    return fn;
+    return s && s->has_update;
 }
 
 bool script_update(Script *s, double dt, wchar_t *err, size_t err_cap)
 {
-    if (lua_getglobal(s->L, "update") != LUA_TFUNCTION) {
-        lua_pop(s->L, 1);
-        return true;
-    }
-    lua_pushnumber(s->L, dt);
-    return protected_call(s, 1, err, err_cap);
+    if (!s->has_update) return true; /* Nothing to run: skip the call entirely. */
+    return call_global(s, CALL_DT, "update", dt, NULL, err, err_cap);
 }
 
 bool script_event(Script *s, const char *fn, wchar_t *err, size_t err_cap)
 {
-    if (lua_getglobal(s->L, fn) != LUA_TFUNCTION) {
-        lua_pop(s->L, 1);
-        return true;
-    }
-    return protected_call(s, 0, err, err_cap);
-}
-
-/* (fn, peer*) -> fn(peer table). */
-static int call_with_peer(lua_State *L)
-{
-    const ScriptPeer *p = (const ScriptPeer *)lua_touserdata(L, 2);
-    lua_settop(L, 1);
-    push_peer(L, p);
-    lua_call(L, 1, 0);
-    return 0;
+    return call_global(s, CALL_PLAIN, fn, 0, NULL, err, err_cap);
 }
 
 bool script_event_peer(Script *s, const char *fn, const ScriptPeer *other, wchar_t *err, size_t err_cap)
 {
-    int type = lua_getglobal(s->L, fn);
-    lua_pop(s->L, 1);
-    if (type != LUA_TFUNCTION) return true;
-    /* The peer table is built inside the protected call: allocating it can hit
-     * the memory cap, and an unprotected error would abort the process. */
-    lua_pushcfunction(s->L, call_with_peer);
-    lua_getglobal(s->L, fn);
-    lua_pushlightuserdata(s->L, (void *)other);
-    return protected_call(s, 2, err, err_cap);
+    return call_global(s, CALL_PEER, fn, 0, other, err, err_cap);
 }

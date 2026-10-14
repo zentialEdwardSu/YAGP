@@ -22,10 +22,17 @@ static void emit(ContactFn fn, void *ctx, uint64_t key, bool begin)
 
 void contacts_update(Contacts *c, const ContactBox *boxes, int n, ContactFn fn, void *ctx)
 {
-    /* All pairs: a handful of overlays, so O(n^2) is a few dozen comparisons. */
+    /* All pairs: a handful of overlays, so O(n^2) is a few dozen comparisons.
+     * Called every tick something moves: the new set goes into a spare buffer
+     * that is swapped with the old one, so steady state allocates nothing. */
     int cap = n > 1 ? n * (n - 1) / 2 : 1;
-    uint64_t *now = (uint64_t *)malloc((size_t)cap * sizeof(uint64_t));
-    if (!now) return; /* Keep the previous state; try again next update. */
+    if (cap > c->spare_cap) {
+        uint64_t *grown = (uint64_t *)realloc(c->spare, (size_t)cap * sizeof(uint64_t));
+        if (!grown) return; /* Keep the previous state; try again next update. */
+        c->spare = grown;
+        c->spare_cap = cap;
+    }
+    uint64_t *now = c->spare;
     int m = 0;
     for (int i = 0; i < n; ++i) {
         const ContactBox *a = &boxes[i];
@@ -48,10 +55,13 @@ void contacts_update(Contacts *c, const ContactBox *boxes, int n, ContactFn fn, 
         if (i == c->n || c->pairs[i] != now[j]) emit(fn, ctx, now[j], true);
     }
 
-    free(c->pairs);
+    uint64_t *old = c->pairs;
+    int old_cap = c->cap;
     c->pairs = now;
+    c->cap = c->spare_cap;
     c->n = m;
-    c->cap = cap;
+    c->spare = old;
+    c->spare_cap = old_cap;
 }
 
 void hitbox_in_window(const int box[4], int gif_w, int gif_h, int win_w, int win_h, bool flip_x,
@@ -90,5 +100,6 @@ void hitbox_in_window(const int box[4], int gif_w, int gif_h, int win_w, int win
 void contacts_free(Contacts *c)
 {
     free(c->pairs);
+    free(c->spare);
     memset(c, 0, sizeof(*c));
 }

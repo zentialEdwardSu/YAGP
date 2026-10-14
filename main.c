@@ -5,6 +5,7 @@
 #include "monitors.h"
 #include "overlay.h"
 
+#include <cderr.h>
 #include <commdlg.h>
 #include <objbase.h>
 #include <shellapi.h>
@@ -426,11 +427,14 @@ static int run_picker(int argc, wchar_t **argv)
     uint64_t id = wcstoull(argv[3], NULL, 16);
     HRESULT com = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 
-    const DWORD cap = 32768;
+    /* Multi-select returns "dir\0name\0name\0\0". 1M characters (2 MB, in this
+     * short-lived helper) fits thousands of files; 32K could fail with
+     * FNERR_BUFFERTOOSMALL after a few hundred, which looked like a cancel. */
+    const DWORD cap = 1u << 20;
     wchar_t *buf = (wchar_t *)calloc(cap, sizeof(wchar_t));
-    wchar_t *out = (wchar_t *)calloc((size_t)cap * 2, sizeof(wchar_t));
+    wchar_t *out = NULL;
     int rc = 1;
-    if (!buf || !out) goto done;
+    if (!buf) goto done;
     OPENFILENAMEW ofn;
     memset(&ofn, 0, sizeof(ofn));
     ofn.lStructSize = sizeof(ofn);
@@ -440,21 +444,37 @@ static int run_picker(int argc, wchar_t **argv)
     ofn.lpstrTitle = multi ? TXT_TITLE_ADD_GIF : script ? TXT_TITLE_PICK_SCRIPT : TXT_TITLE_REPLACE_GIF;
     ofn.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY |
                 (multi ? OFN_ALLOWMULTISELECT : 0);
-    if (!GetOpenFileNameW(&ofn)) { rc = 0; goto done; } /* Cancelled. */
+    if (!GetOpenFileNameW(&ofn)) {
+        if (CommDlgExtendedError() == FNERR_BUFFERTOOSMALL) MessageBoxW(NULL, TXT_ERR_TOO_MANY_FILES, L"YAGP", MB_OK | MB_ICONWARNING);
+        else rc = 0; /* Cancelled. */
+        goto done;
+    }
 
-    /* Normalise both dialog result shapes into "full\0full\0\0". */
-    size_t used = 0, out_cap = (size_t)cap * 2;
+    /* Normalise both dialog result shapes into "full\0full\0\0". Each name
+     * grows by the directory, so size the output from the input instead of
+     * guessing: nothing is truncated or dropped. */
     const wchar_t *first = buf, *name = buf + wcslen(buf) + 1;
-    if (!multi || !*name) {
-        size_t len = wcslen(first);
-        if (len + 2 > out_cap) goto done;
-        memcpy(out, first, (len + 1) * sizeof(wchar_t));
-        used = len + 1;
+    bool several = multi && *name;
+    size_t dir_len = wcslen(first), need = 1; /* Final NUL. */
+    size_t sep = dir_len && first[dir_len - 1] == L'\\' ? 0 : 1; /* "C:\" already ends in one. */
+    if (!several) {
+        need += dir_len + 1;
+    } else {
+        for (const wchar_t *n = name; *n; n += wcslen(n) + 1) need += dir_len + sep + wcslen(n) + 1;
+    }
+    out = (wchar_t *)malloc(need * sizeof(wchar_t));
+    if (!out) goto done;
+    size_t used = 0;
+    if (!several) {
+        memcpy(out, first, (dir_len + 1) * sizeof(wchar_t));
+        used = dir_len + 1;
     } else {
         for (; *name; name += wcslen(name) + 1) {
-            int len = _snwprintf_s(out + used, out_cap - used - 1, _TRUNCATE, L"%s\\%s", first, name);
-            if (len <= 0) break;
-            used += (size_t)len + 1;
+            size_t len = wcslen(name);
+            memcpy(out + used, first, dir_len * sizeof(wchar_t));
+            if (sep) out[used + dir_len] = L'\\';
+            memcpy(out + used + dir_len + sep, name, (len + 1) * sizeof(wchar_t));
+            used += dir_len + sep + len + 1;
         }
     }
     out[used++] = 0;
@@ -760,6 +780,9 @@ static LRESULT CALLBACK tray_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_APP + 2:
         handle_copydata((const COPYDATASTRUCT *)lp);
         free((void *)lp);
+        return 0;
+    case WM_APP_CACHE_READY:
+        overlay_cache_ready((void *)lp);
         return 0;
     case WM_DISPLAYCHANGE:
     case WM_DPICHANGED:
