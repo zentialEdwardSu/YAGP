@@ -1,0 +1,12 @@
+// Application icon: the lowest icon ID is what Explorer shows for the exe; the
+// tray loads it too (make_tray_icon). Regenerate from specturebot.png (rounded
+// corners, 16-256 px) with: python tools/make_icon.py
+1 ICON "app.ico"
+
+// Built-in motion presets (UTF-8 Lua source), loaded with FindResource by name.
+// The same files in scripts\ double as examples for custom scripts.
+PATROL RCDATA "scripts\\patrol.lua"
+WANDER RCDATA "scripts\\wander.lua"
+BOUNCE RCDATA "scripts\\bounce.lua"
+FOLLOW RCDATA "scripts\\follow.lua"
+FLEE RCDATA "scripts\\flee.lua"

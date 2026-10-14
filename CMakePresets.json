@@ -1,0 +1,43 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 25, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "release",
+      "displayName": "Visual Studio, x64 (no developer shell needed)",
+      "description": "No generator is named, so CMake uses the newest installed Visual Studio and locates MSVC and the Windows SDK itself.",
+      "binaryDir": "${sourceDir}/out",
+      "architecture": { "value": "x64", "strategy": "set" }
+    },
+    {
+      "name": "release-en",
+      "inherits": "release",
+      "displayName": "Visual Studio, x64, English UI",
+      "binaryDir": "${sourceDir}/out-en",
+      "cacheVariables": { "YAGP_LANG": "en" }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "release",
+      "configurePreset": "release",
+      "configuration": "Release",
+      "targets": ["yagp", "script_test", "gif_dump"]
+    },
+    {
+      "name": "release-en",
+      "configurePreset": "release-en",
+      "configuration": "Release",
+      "targets": ["yagp", "script_test", "gif_dump"]
+    }
+  ],
+  "workflowPresets": [
+    {
+      "name": "release",
+      "steps": [
+        { "type": "configure", "name": "release" },
+        { "type": "build", "name": "release" }
+      ]
+    }
+  ]
+}
