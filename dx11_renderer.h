@@ -34,10 +34,15 @@ bool render_surface_present(RenderSurface *s, const uint8_t *bgra);
 bool render_surface_present_dirty(RenderSurface *s, const uint8_t *bgra, const RECT *dirty);
 /* Resize the swap chain when the GIF is replaced by one with other dimensions. */
 bool render_surface_resize(RenderSurface *s, int width, int height);
-/* Scale the visual on the DWM side (nearest-neighbour); buffers keep native size. */
-bool render_surface_set_scale(RenderSurface *s, float scale);
-/* Mirror the visual horizontally (kept across set_scale / resize). */
-bool render_surface_set_flip(RenderSurface *s, bool flip_x);
+/* Sets the visual's transform (D2D row-vector matrix: x' = x*m[0] + y*m[2] +
+ * m[4], y' = x*m[1] + y*m[3] + m[5], from swap-chain pixels to window
+ * pixels; nearest-neighbour sampling). With duration > 0 DWM animates every
+ * element from `from` to `to`, each following the cubic c[0] + c[1]u + c[2]u^2
+ * + c[3]u^3 of u = elapsed / duration, starting now: no CPU work per frame. */
+bool render_surface_set_matrix(RenderSurface *s, const double to[6], const double *from, double duration,
+                               const double cubic[4]);
+/* Opacity 0..1, animated like the matrix when duration > 0. */
+bool render_surface_set_opacity(RenderSurface *s, double to, double from, double duration, const double cubic[4]);
 
 #ifdef __cplusplus
 }

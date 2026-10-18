@@ -3,6 +3,7 @@
 #include "i18n.h"
 #include "monitors.h"
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -15,6 +16,14 @@
 #define SCRIPT_MEM_LIMIT (4u * 1024u * 1024u)
 #define SCRIPT_HOOK_STEP 1000          /* Instructions between hook calls. */
 #define SCRIPT_HOOK_BUDGET 10000       /* Hook calls per entry: ~10M instructions. */
+#define SCRIPT_MAX_TIMERS 64
+#define SCRIPT_MAX_HANDLERS 64         /* yagp.on subscriptions alive at once. */
+
+/* yagp.after / yagp.every. The function lives in the registry (ref). */
+typedef struct Timer {
+    double due, period;      /* period 0 = one-shot. */
+    int id, ref;
+} Timer;
 
 struct Script {
     lua_State *L;
@@ -29,6 +38,27 @@ struct Script {
      * times per tick, once per overlay and peer. */
     bool has_update;
     char name[128];
+    const ScriptHostExtOps *ext;   /* NULL: clip / transform / input functions are no-ops. */
+    /* yagp.on handlers: count per event, plus the legacy globals (on_moved ...)
+     * found after the last call. subs = the union, as reported to the host. */
+    int handler_count[SEV_COUNT];
+    int handlers_total;
+    unsigned legacy, subs, reported;
+    int next_handle;
+    int depth;                     /* Handler lists being iterated (no compaction meanwhile). */
+    int dead_handlers;             /* Removed entries still in the lists. */
+    Timer timers[SCRIPT_MAX_TIMERS];
+    int timer_count;
+};
+
+/* Registry keys (addresses are unique and never collected). */
+static char HANDLERS_KEY, EVTABLES_KEY;
+
+static const char *const EVENT_NAMES[SEV_COUNT] = {
+    "mouse_down", "mouse_up", "click", "double_click", "mouse_enter", "mouse_leave", "hover",
+    "mouse_move", "wheel", "drag_start", "drag", "drag_end",
+    "cursor", "peer_moved", "peer_added", "peer_removed", "collide", "separate", "moved",
+    "screens_changed", "frame", "clip_end", "transform_end",
 };
 
 static void *limited_alloc(void *ud, void *ptr, size_t osize, size_t nsize)
@@ -504,6 +534,607 @@ static int l_print(lua_State *L)
     return 0;
 }
 
+/* ---- subscriptions (yagp.on / off) and timers ------------------------------
+ * Handlers live in registry tables: HANDLERS_KEY[ev + 1] is the list of entry
+ * tables for ev, in subscription order; BYID_KEY[handle] is the entry. An
+ * entry is {fn = f, id = h, ev = e, <options>, <filter state>}. The host only
+ * calls into Lua for events whose bit is in script_subscriptions(), so an
+ * unsubscribed event costs one bit test. */
+
+static char BYID_KEY;
+
+static double script_now(Script *s)
+{
+    if (s->ext && s->ext->now) return s->ext->now(s->ctx);
+    LARGE_INTEGER t, f;
+    QueryPerformanceCounter(&t);
+    QueryPerformanceFrequency(&f);
+    return (double)t.QuadPart / (double)f.QuadPart;
+}
+
+/* Pushes registry[key], creating an empty table on first use. */
+static void push_reg_table(lua_State *L, const void *key)
+{
+    if (lua_rawgetp(L, LUA_REGISTRYINDEX, key) == LUA_TTABLE) return;
+    lua_pop(L, 1);
+    lua_newtable(L);
+    lua_pushvalue(L, -1);
+    lua_rawsetp(L, LUA_REGISTRYINDEX, key);
+}
+
+/* Pushes the handler list of ev (created on first use). */
+static void push_handler_list(lua_State *L, int ev)
+{
+    push_reg_table(L, &HANDLERS_KEY);
+    if (lua_rawgeti(L, -1, ev + 1) != LUA_TTABLE) {
+        lua_pop(L, 1);
+        lua_newtable(L);
+        lua_pushvalue(L, -1);
+        lua_rawseti(L, -3, ev + 1);
+    }
+    lua_remove(L, -2);
+}
+
+static const char *const LEGACY_NAMES[] = {"on_moved", "on_screens_changed", "on_collide", "on_separate"};
+static const int LEGACY_EVENTS[] = {SEV_MOVED, SEV_SCREENS_CHANGED, SEV_COLLIDE, SEV_SEPARATE};
+
+static const char *legacy_name(int ev)
+{
+    switch (ev) {
+    case SEV_MOVED: return "on_moved";
+    case SEV_SCREENS_CHANGED: return "on_screens_changed";
+    case SEV_COLLIDE: return "on_collide";
+    case SEV_SEPARATE: return "on_separate";
+    default: return NULL;
+    }
+}
+
+/* Recomputes the subscription mask and tells the host when it changed. */
+static void refresh_subs(Script *s)
+{
+    unsigned m = s->legacy;
+    for (int e = 0; e < SEV_COUNT; ++e) {
+        if (s->handler_count[e] > 0) m |= SEV_BIT(e);
+    }
+    s->subs = m;
+    if (m != s->reported) {
+        s->reported = m;
+        if (s->ext && s->ext->subs_changed) s->ext->subs_changed(s->ctx, m);
+    }
+}
+
+/* opts[name] as a number in [lo, hi], or def when absent. */
+static double opt_number(lua_State *L, int opts, const char *name, double lo, double hi, double def)
+{
+    if (!opts) return def;
+    lua_getfield(L, opts, name);
+    if (lua_isnil(L, -1)) {
+        lua_pop(L, 1);
+        return def;
+    }
+    int isnum = 0;
+    double v = (double)lua_tonumberx(L, -1, &isnum);
+    lua_pop(L, 1);
+    if (!isnum || !(v >= lo && v <= hi)) luaL_error(L, TXT_U8_BAD_OPTION, name);
+    return v;
+}
+
+/* opts[name] as a string (pushed), or nothing pushed and false. */
+static bool opt_string(lua_State *L, int opts, const char *name)
+{
+    if (!opts) return false;
+    int t = lua_getfield(L, opts, name);
+    if (t == LUA_TNIL) {
+        lua_pop(L, 1);
+        return false;
+    }
+    if (t != LUA_TSTRING) luaL_error(L, TXT_U8_BAD_OPTION, name);
+    return true;
+}
+
+static void set_num(lua_State *L, int t, const char *k, double v)
+{
+    t = lua_absindex(L, t);
+    lua_pushnumber(L, v);
+    lua_setfield(L, t, k);
+}
+
+static void set_int(lua_State *L, int t, const char *k, lua_Integer v)
+{
+    t = lua_absindex(L, t);
+    lua_pushinteger(L, v);
+    lua_setfield(L, t, k);
+}
+
+static void set_bool(lua_State *L, int t, const char *k, bool v)
+{
+    t = lua_absindex(L, t);
+    lua_pushboolean(L, v);
+    lua_setfield(L, t, k);
+}
+
+static double get_num(lua_State *L, int t, const char *k, double def)
+{
+    t = lua_absindex(L, t);
+    lua_getfield(L, t, k);
+    int isnum = 0;
+    double v = (double)lua_tonumberx(L, -1, &isnum);
+    lua_pop(L, 1);
+    return isnum ? v : def;
+}
+
+static bool get_bool(lua_State *L, int t, const char *k)
+{
+    t = lua_absindex(L, t);
+    lua_getfield(L, t, k);
+    bool v = lua_toboolean(L, -1);
+    lua_pop(L, 1);
+    return v;
+}
+/* Drops dead entries from every handler list. Only between dispatches (an
+ * index shift during one would skip or repeat handlers). */
+static void compact_handlers(lua_State *L, Script *s)
+{
+    if (!s->dead_handlers || s->depth > 0) return;
+    push_reg_table(L, &HANDLERS_KEY);
+    int lists = lua_gettop(L);
+    for (int e = 0; e < SEV_COUNT; ++e) {
+        if (lua_rawgeti(L, lists, e + 1) != LUA_TTABLE) {
+            lua_pop(L, 1);
+            continue;
+        }
+        int list = lua_gettop(L);
+        lua_Integer n = (lua_Integer)lua_rawlen(L, list), w = 1;
+        for (lua_Integer i = 1; i <= n; ++i) {
+            lua_rawgeti(L, list, i);
+            if (get_bool(L, -1, "dead")) {
+                lua_pop(L, 1);
+                continue;
+            }
+            lua_rawseti(L, list, w++);
+        }
+        for (; w <= n; ++w) {
+            lua_pushnil(L);
+            lua_rawseti(L, list, w);
+        }
+        lua_pop(L, 1);
+    }
+    lua_pop(L, 1);
+    s->dead_handlers = 0;
+}
+
+static int event_index(const char *name)
+{
+    for (int e = 0; e < SEV_COUNT; ++e) {
+        if (strcmp(name, EVENT_NAMES[e]) == 0) return e;
+    }
+    return -1;
+}
+
+/* yagp.on(event, fn [, opts]) -> handle */
+static int l_on(lua_State *L)
+{
+    Script *s = self(L);
+    const char *name = luaL_checkstring(L, 1);
+    int ev = event_index(name);
+    if (ev < 0) return luaL_error(L, TXT_U8_UNKNOWN_EVENT, name);
+    luaL_checktype(L, 2, LUA_TFUNCTION);
+    int opts = lua_isnoneornil(L, 3) ? 0 : 3;
+    if (opts) luaL_checktype(L, 3, LUA_TTABLE);
+    if (s->handlers_total >= SCRIPT_MAX_HANDLERS) return luaL_error(L, TXT_U8_TOO_MANY, SCRIPT_MAX_HANDLERS);
+    compact_handlers(L, s);
+
+    lua_createtable(L, 0, 8);
+    int entry = lua_gettop(L);
+    lua_pushvalue(L, 2);
+    lua_setfield(L, entry, "fn");
+    int id = ++s->next_handle;
+    set_int(L, entry, "id", id);
+    set_int(L, entry, "ev", ev);
+    /* Options, validated here so a typo fails at the call, not silently later. */
+    if (ev == SEV_CURSOR) {
+        set_num(L, entry, "min_move", opt_number(L, opts, "min_move", 0, 1e6, 0));
+        set_num(L, entry, "radius", opt_number(L, opts, "radius", 0, 1e6, 0));
+        set_num(L, entry, "rate", opt_number(L, opts, "rate", 0, 1000, 0));
+        set_num(L, entry, "lt", -1e9);
+    } else if (ev == SEV_PEER_MOVED || ev == SEV_PEER_ADDED || ev == SEV_PEER_REMOVED) {
+        set_num(L, entry, "peer", opt_number(L, opts, "id", 0, 2147483647.0, 0));
+        set_num(L, entry, "radius", opt_number(L, opts, "radius", 0, 1e6, 0));
+    } else if (ev == SEV_FRAME || ev == SEV_CLIP_END) {
+        if (opt_string(L, opts, "clip")) lua_setfield(L, entry, "clip");
+        if (ev == SEV_FRAME && opts && lua_getfield(L, opts, "frames") != LUA_TNIL) {
+            /* {3, 7} (1-based) -> set {[2] = true, [6] = true} keyed 0-based. */
+            if (!lua_istable(L, -1)) return luaL_error(L, TXT_U8_BAD_OPTION, "frames");
+            lua_newtable(L);
+            lua_Integer n = (lua_Integer)lua_rawlen(L, -2);
+            for (lua_Integer i = 1; i <= n; ++i) {
+                lua_rawgeti(L, -2, i);
+                int isnum = 0;
+                lua_Integer f = lua_tointegerx(L, -1, &isnum);
+                lua_pop(L, 1);
+                if (!isnum || f < 1) return luaL_error(L, TXT_U8_BAD_OPTION, "frames");
+                lua_pushboolean(L, 1);
+                lua_rawseti(L, -2, f - 1);
+            }
+            lua_setfield(L, entry, "frames");
+            lua_pop(L, 1);
+        } else if (ev == SEV_FRAME && opts) {
+            lua_pop(L, 1);
+        }
+    }
+    push_handler_list(L, ev);
+    lua_pushvalue(L, entry);
+    lua_rawseti(L, -2, (lua_Integer)lua_rawlen(L, -2) + 1);
+    lua_pop(L, 1);
+    push_reg_table(L, &BYID_KEY);
+    lua_pushvalue(L, entry);
+    lua_rawseti(L, -2, id);
+    lua_pop(L, 1);
+    s->handler_count[ev]++;
+    s->handlers_total++;
+    refresh_subs(s);
+    lua_pushinteger(L, id);
+    return 1;
+}
+
+/* yagp.off(handle): unknown or already removed handles are ignored. */
+static int l_off(lua_State *L)
+{
+    Script *s = self(L);
+    lua_Integer id = luaL_checkinteger(L, 1);
+    push_reg_table(L, &BYID_KEY);
+    if (lua_rawgeti(L, -1, id) != LUA_TTABLE) return 0;
+    set_bool(L, -1, "dead", true);
+    int ev = (int)get_num(L, -1, "ev", 0);
+    lua_pop(L, 1);
+    lua_pushnil(L);
+    lua_rawseti(L, -2, id);
+    if (ev >= 0 && ev < SEV_COUNT && s->handler_count[ev] > 0) s->handler_count[ev]--;
+    s->handlers_total--;
+    s->dead_handlers++;
+    compact_handlers(L, s);
+    refresh_subs(s);
+    return 0;
+}
+
+/* ---- timers ---------------------------------------------------------------- */
+
+static int add_timer(lua_State *L, bool repeat)
+{
+    Script *s = self(L);
+    double sec = luaL_checknumber(L, 1);
+    luaL_checktype(L, 2, LUA_TFUNCTION);
+    double lo = repeat ? 1.0 / SCRIPT_RATE_MAX : 0.0;
+    luaL_argcheck(L, sec == sec && sec < 1e7, 1, TXT_U8_COORD_RANGE);
+    if (sec < lo) sec = lo;
+    if (s->timer_count >= SCRIPT_MAX_TIMERS) return luaL_error(L, TXT_U8_TOO_MANY, SCRIPT_MAX_TIMERS);
+    lua_pushvalue(L, 2);
+    int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    Timer *t = &s->timers[s->timer_count++];
+    t->due = script_now(s) + sec;
+    t->period = repeat ? sec : 0;
+    t->ref = ref;
+    t->id = ++s->next_handle;
+    lua_pushinteger(L, t->id);
+    return 1;
+}
+
+static int l_after(lua_State *L) { return add_timer(L, false); }
+static int l_every(lua_State *L) { return add_timer(L, true); }
+
+static void remove_timer(lua_State *L, Script *s, int i)
+{
+    luaL_unref(L, LUA_REGISTRYINDEX, s->timers[i].ref);
+    s->timers[i] = s->timers[--s->timer_count];
+}
+
+/* yagp.cancel(handle) */
+static int l_cancel(lua_State *L)
+{
+    Script *s = self(L);
+    lua_Integer id = luaL_checkinteger(L, 1);
+    for (int i = 0; i < s->timer_count; ++i) {
+        if (s->timers[i].id == id) {
+            remove_timer(L, s, i);
+            break;
+        }
+    }
+    return 0;
+}
+/* ---- clips, playback, composition, input behaviour --------------------------
+ * Thin argument checks; the host does the work through ScriptHostExtOps. */
+
+static const ScriptHostExtOps *ext(lua_State *L)
+{
+    return self(L)->ext;
+}
+
+static const char *check_clip_name(lua_State *L, int arg)
+{
+    size_t n;
+    const char *name = luaL_checklstring(L, arg, &n);
+    luaL_argcheck(L, n > 0 && n < SCRIPT_CLIP_NAME_MAX && strlen(name) == n, arg, TXT_U8_BAD_CLIP_NAME);
+    return name;
+}
+
+/* Pushes nil, err; returns 2. */
+static int fail_with(lua_State *L, const char *msg)
+{
+    lua_pushnil(L);
+    lua_pushstring(L, msg && *msg ? msg : TXT_U8_UNAVAILABLE);
+    return 2;
+}
+
+/* yagp.clip(name, relpath) -> true | nil, err */
+static int l_clip(lua_State *L)
+{
+    Script *s = self(L);
+    const char *name = check_clip_name(L, 1);
+    const char *rel = luaL_checkstring(L, 2);
+    luaL_argcheck(L, strcmp(name, "main") != 0, 1, TXT_U8_BAD_CLIP_NAME);
+    char err[256] = "";
+    if (!s->ext || !s->ext->load_clip) return fail_with(L, NULL);
+    if (!s->ext->load_clip(s->ctx, name, rel, err, sizeof(err))) return fail_with(L, err);
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+static int l_unload(lua_State *L)
+{
+    Script *s = self(L);
+    const char *name = check_clip_name(L, 1);
+    if (strcmp(name, "main") != 0 && s->ext && s->ext->unload_clip) s->ext->unload_clip(s->ctx, name);
+    return 0;
+}
+
+/* yagp.clip_info(name) -> {w, h, frames, duration, delays, ready} | nil */
+static int l_clip_info(lua_State *L)
+{
+    Script *s = self(L);
+    const char *name = check_clip_name(L, 1);
+    ScriptClipInfo ci;
+    memset(&ci, 0, sizeof(ci));
+    if (!s->ext || !s->ext->clip_info || !s->ext->clip_info(s->ctx, name, &ci)) {
+        lua_pushnil(L);
+        return 1;
+    }
+    lua_createtable(L, 0, 6);
+    int t = lua_gettop(L);
+    set_int(L, t, "w", ci.w);
+    set_int(L, t, "h", ci.h);
+    set_bool(L, t, "ready", ci.frames > 0);
+    if (ci.frames > 0) {
+        set_int(L, t, "frames", ci.frames);
+        set_num(L, t, "duration", ci.duration);
+        if (ci.delays) {
+            lua_createtable(L, ci.frames, 0);
+            for (int i = 0; i < ci.frames; ++i) {
+                lua_pushnumber(L, ci.delays[i] / 1000.0);
+                lua_rawseti(L, -2, i + 1);
+            }
+            lua_setfield(L, t, "delays");
+        }
+    }
+    return 1;
+}
+
+static int anchor_from(lua_State *L, int opts)
+{
+    if (!opt_string(L, opts, "anchor")) return SANCHOR_BOTTOM;
+    static const char *const names[] = {"bottom", "center", "top_left", NULL};
+    int i = luaL_checkoption(L, -1, NULL, names);
+    lua_pop(L, 1);
+    return i;
+}
+
+/* yagp.play(name [, {from, to, loop, speed, anchor, sync, restart}]) -> true | nil, err */
+static int l_play(lua_State *L)
+{
+    Script *s = self(L);
+    const char *name = check_clip_name(L, 1);
+    int opts = lua_isnoneornil(L, 2) ? 0 : 2;
+    if (opts) luaL_checktype(L, 2, LUA_TTABLE);
+    ScriptPlay p;
+    p.from = (int)opt_number(L, opts, "from", 1, 65535, 0) - 1;
+    p.to = (int)opt_number(L, opts, "to", 1, 65535, 0) - 1;
+    if (p.from >= 0 && p.to >= 0) luaL_argcheck(L, p.from <= p.to, 2, TXT_U8_BAD_RANGE);
+    p.loops = -1;
+    if (opts) {
+        int t = lua_getfield(L, opts, "loop");
+        if (t == LUA_TBOOLEAN) p.loops = lua_toboolean(L, -1) ? -1 : 1;
+        else if (t == LUA_TNUMBER) {
+            lua_Integer n = lua_tointeger(L, -1);
+            if (n < 1 || n > 1000000) return luaL_error(L, TXT_U8_BAD_OPTION, "loop");
+            p.loops = (int)n;
+        } else if (t != LUA_TNIL) return luaL_error(L, TXT_U8_BAD_OPTION, "loop");
+        lua_pop(L, 1);
+    }
+    p.speed = opt_number(L, opts, "speed", 0.1, 10, 1);
+    p.anchor = anchor_from(L, opts);
+    p.sync = opts && get_bool(L, opts, "sync");
+    p.restart = true;
+    if (opts) {
+        lua_getfield(L, opts, "restart");
+        if (!lua_isnil(L, -1)) p.restart = lua_toboolean(L, -1);
+        lua_pop(L, 1);
+    }
+    char err[256] = "";
+    if (!s->ext || !s->ext->play) return fail_with(L, NULL);
+    if (!s->ext->play(s->ctx, name, &p, err, sizeof(err))) return fail_with(L, err);
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+static int l_seek(lua_State *L)
+{
+    Script *s = self(L);
+    lua_Integer f = luaL_checkinteger(L, 1);
+    luaL_argcheck(L, f >= 1 && f <= 65535, 1, TXT_U8_BAD_RANGE);
+    lua_pushboolean(L, s->ext && s->ext->seek && s->ext->seek(s->ctx, (int)f - 1));
+    return 1;
+}
+
+/* yagp.frame() -> clip name, frame (1-based), frames (nil until known) */
+static int l_frame(lua_State *L)
+{
+    Script *s = self(L);
+    const char *name = "main";
+    int frame = 0, frames = 0;
+    if (s->ext && s->ext->get_frame) s->ext->get_frame(s->ctx, &name, &frame, &frames);
+    lua_pushstring(L, name ? name : "main");
+    lua_pushinteger(L, frame + 1);
+    if (frames > 0) lua_pushinteger(L, frames);
+    else lua_pushnil(L);
+    return 3;
+}
+
+static int l_set_speed(lua_State *L)
+{
+    Script *s = self(L);
+    double v = luaL_checknumber(L, 1);
+    luaL_argcheck(L, v >= 0.1 && v <= 10, 1, TXT_U8_BAD_RANGE);
+    if (s->ext && s->ext->set_speed) s->ext->set_speed(s->ctx, v);
+    return 0;
+}
+
+static int l_set_playing(lua_State *L)
+{
+    Script *s = self(L);
+    if (s->ext && s->ext->set_playing) s->ext->set_playing(s->ctx, lua_toboolean(L, 1));
+    return 0;
+}
+
+static int easing_from(lua_State *L, int arg)
+{
+    static const char *const names[] = {"linear", "ease_in", "ease_out", "ease_in_out", NULL};
+    return luaL_checkoption(L, arg, "ease_out", names);
+}
+
+static double check_duration(lua_State *L, int arg)
+{
+    double d = luaL_optnumber(L, arg, 0);
+    luaL_argcheck(L, d >= 0 && d <= 60, arg, TXT_U8_BAD_RANGE);
+    return d;
+}
+
+/* Matrix element in a sane range: scale-ish parts within +-8, translation +-4096. */
+static void check_matrix(lua_State *L, const double m[6])
+{
+    for (int i = 0; i < 6; ++i) {
+        double lim = i < 4 ? 8.0 : 4096.0;
+        if (!(m[i] >= -lim && m[i] <= lim)) luaL_error(L, TXT_U8_BAD_MATRIX);
+    }
+    double det = m[0] * m[3] - m[1] * m[2];
+    if (!(det > 0.0025 || det < -0.0025)) luaL_error(L, TXT_U8_BAD_MATRIX); /* Degenerate: no inverse. */
+}
+
+static void apply_matrix(lua_State *L, const double m[6], double duration, int easing)
+{
+    Script *s = self(L);
+    check_matrix(L, m);
+    if (s->ext && s->ext->set_matrix && !s->ext->set_matrix(s->ctx, m, duration, easing))
+        luaL_error(L, TXT_U8_BAD_MATRIX);
+}
+
+/* yagp.set_matrix(m11, m12, m21, m22, dx, dy [, duration, easing]) */
+static int l_set_matrix(lua_State *L)
+{
+    double m[6];
+    for (int i = 0; i < 6; ++i) m[i] = luaL_checknumber(L, i + 1);
+    apply_matrix(L, m, check_duration(L, 7), easing_from(L, 8));
+    return 0;
+}
+
+/* yagp.set_transform{sx, sy, angle, kx, ky, px, py, tx, ty, duration, easing}
+ * About the pivot (px, py) in GIF pixels (default: bottom centre): scale, then
+ * skew (kx, ky in degrees), then rotate (angle in degrees, clockwise on
+ * screen), then move by (tx, ty) display pixels. */
+static int l_set_transform(lua_State *L)
+{
+    const double rad = 3.14159265358979323846 / 180.0;
+    luaL_checktype(L, 1, LUA_TTABLE);
+    Script *s = self(L);
+    double sx = opt_number(L, 1, "sx", -8, 8, 1), sy = opt_number(L, 1, "sy", -8, 8, 1);
+    double a = opt_number(L, 1, "angle", -3600, 3600, 0) * rad;
+    double tkx = tan(opt_number(L, 1, "kx", -80, 80, 0) * rad), tky = tan(opt_number(L, 1, "ky", -80, 80, 0) * rad);
+    double tx = opt_number(L, 1, "tx", -4096, 4096, 0), ty = opt_number(L, 1, "ty", -4096, 4096, 0);
+    double x, y;
+    int w, h;
+    host_rect(s, &x, &y, &w, &h);
+    /* GIF pixels -> window pixels: the window shows the current clip at its display size. */
+    double gw = w, gh = h;
+    const char *cur = NULL;
+    int frame = 0, frames = 0;
+    ScriptClipInfo ci;
+    if (s->ext && s->ext->get_frame && s->ext->clip_info) {
+        s->ext->get_frame(s->ctx, &cur, &frame, &frames);
+        if (cur && s->ext->clip_info(s->ctx, cur, &ci) && ci.w > 0 && ci.h > 0) {
+            gw = ci.w;
+            gh = ci.h;
+        }
+    }
+    double cx = opt_number(L, 1, "px", -65535, 65535, gw / 2) * w / gw;
+    double cy = opt_number(L, 1, "py", -65535, 65535, gh) * h / gh;
+    /* Row vectors (p' = p * M): linear part S * K * R, then T(-c) ... T(c + t). */
+    double ca = cos(a), sa = sin(a);
+    double k11 = sx, k12 = sx * tky, k21 = sy * tkx, k22 = sy;
+    double m[6];
+    m[0] = k11 * ca - k12 * sa;
+    m[1] = k11 * sa + k12 * ca;
+    m[2] = k21 * ca - k22 * sa;
+    m[3] = k21 * sa + k22 * ca;
+    m[4] = cx + tx - cx * m[0] - cy * m[2];
+    m[5] = cy + ty - cx * m[1] - cy * m[3];
+    double duration = opt_number(L, 1, "duration", 0, 60, 0);
+    int easing = SEASE_OUT;
+    if (opt_string(L, 1, "easing")) easing = easing_from(L, lua_gettop(L));
+    apply_matrix(L, m, duration, easing);
+    return 0;
+}
+
+static int l_reset_transform(lua_State *L)
+{
+    Script *s = self(L);
+    static const double identity[6] = {1, 0, 0, 1, 0, 0};
+    double d = check_duration(L, 1);
+    if (s->ext && s->ext->set_matrix) s->ext->set_matrix(s->ctx, d > 0 ? identity : NULL, d, SEASE_OUT);
+    return 0;
+}
+
+static int l_set_opacity(lua_State *L)
+{
+    Script *s = self(L);
+    double a = luaL_checknumber(L, 1);
+    luaL_argcheck(L, a >= 0 && a <= 1, 1, TXT_U8_BAD_RANGE);
+    double d = check_duration(L, 2);
+    int easing = easing_from(L, 3);
+    if (s->ext && s->ext->set_opacity) s->ext->set_opacity(s->ctx, a, d, easing);
+    return 0;
+}
+
+static int l_set_cursor(lua_State *L)
+{
+    Script *s = self(L);
+    static const char *const names[] = {"move", "arrow", "hand", "none", NULL};
+    int shape = luaL_checkoption(L, 1, NULL, names);
+    if (s->ext && s->ext->set_cursor) s->ext->set_cursor(s->ctx, shape);
+    return 0;
+}
+
+static int l_set_draggable(lua_State *L)
+{
+    Script *s = self(L);
+    if (s->ext && s->ext->set_draggable) s->ext->set_draggable(s->ctx, lua_toboolean(L, 1));
+    return 0;
+}
+
+static int l_set_clickthrough(lua_State *L)
+{
+    Script *s = self(L);
+    if (s->ext && s->ext->set_clickthrough) s->ext->set_clickthrough(s->ctx, lua_toboolean(L, 1));
+    return 0;
+}
+
 static const luaL_Reg yagp_lib[] = {
     {"pos", l_pos},         {"set_pos", l_set_pos}, {"move", l_move},
     {"size", l_size},       {"monitors", l_monitors}, {"monitor", l_monitor},
@@ -513,19 +1144,37 @@ static const luaL_Reg yagp_lib[] = {
     {"others", l_others},   {"peer", l_peer},       {"overlaps", l_overlaps},
     {"hitbox", l_hitbox},   {"set_hitbox", l_set_hitbox},
     {"time", l_time},       {"set_flip", l_set_flip}, {"set_rate", l_set_rate},
+    {"on", l_on},           {"off", l_off},
+    {"after", l_after},     {"every", l_every},     {"cancel", l_cancel},
+    {"clip", l_clip},       {"unload", l_unload},   {"clip_info", l_clip_info},
+    {"play", l_play},       {"seek", l_seek},       {"frame", l_frame},
+    {"set_speed", l_set_speed}, {"set_playing", l_set_playing},
+    {"set_matrix", l_set_matrix}, {"set_transform", l_set_transform},
+    {"reset_transform", l_reset_transform}, {"set_opacity", l_set_opacity},
+    {"set_cursor", l_set_cursor}, {"set_draggable", l_set_draggable},
+    {"set_clickthrough", l_set_clickthrough},
     {NULL, NULL}
 };
 
 /* ---- calls into the script ------------------------------------------------ */
 
-enum { CALL_PLAIN, CALL_DT, CALL_PEER, CALL_CHUNK };
+enum { CALL_PLAIN, CALL_DT, CALL_PEER, CALL_CHUNK, CALL_EVENT, CALL_TIMERS };
 
 typedef struct Call {
     Script *s;
-    const char *fn;          /* Global to call (not for CALL_CHUNK). */
+    const char *fn;          /* Global to call (CALL_PLAIN / DT / PEER). */
     int kind;
     double dt;               /* CALL_DT */
-    const ScriptPeer *peer;  /* CALL_PEER */
+    const ScriptPeer *peer;  /* CALL_PEER; CALL_EVENT for peer events */
+    /* CALL_EVENT */
+    int ev;
+    const ScriptInput *in;   /* Input events. */
+    bool handled;            /* Out: a handler stopped the routed event. */
+    int cx, cy;              /* cursor */
+    bool cvalid;
+    const char *clip;        /* frame / clip_end */
+    int frame;
+    double now;              /* CALL_TIMERS */
 } Call;
 
 /* Pushes the global `name` without metamethods. A strict-mode script
@@ -541,6 +1190,251 @@ static int raw_global(lua_State *L, const char *name)
     return type;
 }
 
+/* ---- event dispatch -------------------------------------------------------- */
+
+static const char *button_name(int b)
+{
+    switch (b) {
+    case SBTN_LEFT: return "left";
+    case SBTN_RIGHT: return "right";
+    case SBTN_MIDDLE: return "middle";
+    default: return NULL;
+    }
+}
+
+/* The reused event table of ev (input and cursor events only: they can fire
+ * at mouse rate, so they must not allocate). Pushed. */
+static void push_event_table(lua_State *L, int ev)
+{
+    push_reg_table(L, &EVTABLES_KEY);
+    if (lua_rawgeti(L, -1, ev + 1) != LUA_TTABLE) {
+        lua_pop(L, 1);
+        lua_createtable(L, 0, 16);
+        lua_pushstring(L, EVENT_NAMES[ev]);
+        lua_setfield(L, -2, "type");
+        lua_pushvalue(L, -1);
+        lua_rawseti(L, -3, ev + 1);
+    }
+    lua_remove(L, -2);
+}
+
+static void fill_input(lua_State *L, int t, const ScriptInput *in)
+{
+    const char *b = button_name(in->button);
+    if (b) lua_pushstring(L, b);
+    else lua_pushnil(L);
+    lua_setfield(L, t, "button");
+    set_int(L, t, "x", in->x);
+    set_int(L, t, "y", in->y);
+    set_num(L, t, "gx", in->gx);
+    set_num(L, t, "gy", in->gy);
+    set_int(L, t, "dx", in->dx);
+    set_int(L, t, "dy", in->dy);
+    set_num(L, t, "delta", in->wheel);
+    set_bool(L, t, "opaque", in->opaque);
+    set_bool(L, t, "shift", in->shift);
+    set_bool(L, t, "ctrl", in->ctrl);
+    set_bool(L, t, "alt", in->alt);
+    set_bool(L, t, "passthrough", in->passthrough);
+    set_bool(L, t, "handled", false);
+}
+
+/* Centre of this overlay's hitbox on the desktop. */
+static void self_center(Script *s, double *cx, double *cy)
+{
+    double x, y;
+    int w, h, dx, dy, hw, hh;
+    host_rect(s, &x, &y, &w, &h);
+    host_hitbox(s, &dx, &dy, &hw, &hh);
+    *cx = x + dx + hw / 2.0;
+    *cy = y + dy + hh / 2.0;
+}
+
+/* Per-handler filter. Returns false to skip entry (on top of the stack). May
+ * update the entry's filter state and the event table at arg. */
+static bool accept(lua_State *L, Script *s, const Call *c, int arg)
+{
+    int e = lua_gettop(L);
+    switch (c->ev) {
+    case SEV_CURSOR: {
+        double rate = get_num(L, e, "rate", 0), radius = get_num(L, e, "radius", 0);
+        if (rate > 0) {
+            double now = script_now(s);
+            if (now - get_num(L, e, "lt", -1e9) < 1.0 / rate) return false;
+            set_num(L, e, "lt", now);
+        }
+        if (radius > 0) {
+            double cx, cy;
+            self_center(s, &cx, &cy);
+            double dx = c->cx - cx, dy = c->cy - cy;
+            bool near_now = dx * dx + dy * dy <= radius * radius;
+            lua_getfield(L, e, "near");
+            bool known = !lua_isnil(L, -1), was = lua_toboolean(L, -1);
+            lua_pop(L, 1);
+            if (known && was == near_now) return false;
+            if (!known && !near_now) { /* Starting outside: nothing to report yet. */
+                set_bool(L, e, "near", false);
+                return false;
+            }
+            set_bool(L, e, "near", near_now);
+            set_bool(L, arg, "near", near_now);
+            return true;
+        }
+        double min_move = get_num(L, e, "min_move", 0);
+        if (min_move > 0) {
+            double lx = get_num(L, e, "lx", -1e18), ly = get_num(L, e, "ly", -1e18);
+            double dx = c->cx - lx, dy = c->cy - ly;
+            if (dx * dx + dy * dy < min_move * min_move) return false;
+            set_num(L, e, "lx", c->cx);
+            set_num(L, e, "ly", c->cy);
+        }
+        lua_pushnil(L);
+        lua_setfield(L, arg, "near");
+        return true;
+    }
+    case SEV_PEER_MOVED: case SEV_PEER_ADDED: case SEV_PEER_REMOVED:
+    case SEV_COLLIDE: case SEV_SEPARATE: {
+        double want = get_num(L, e, "peer", 0);
+        if (want > 0 && (int)want != c->peer->id) return false;
+        double radius = get_num(L, e, "radius", 0);
+        if (radius > 0 && c->ev != SEV_PEER_REMOVED) {
+            double cx, cy;
+            self_center(s, &cx, &cy);
+            double dx = c->peer->hx + c->peer->hw / 2.0 - cx, dy = c->peer->hy + c->peer->hh / 2.0 - cy;
+            if (dx * dx + dy * dy > radius * radius) return false;
+        }
+        return true;
+    }
+    case SEV_FRAME: case SEV_CLIP_END: {
+        if (lua_getfield(L, e, "clip") == LUA_TSTRING && strcmp(lua_tostring(L, -1), c->clip) != 0) {
+            lua_pop(L, 1);
+            return false;
+        }
+        lua_pop(L, 1);
+        if (c->ev == SEV_FRAME && lua_getfield(L, e, "frames") == LUA_TTABLE) {
+            bool hit = lua_rawgeti(L, -1, c->frame) != LUA_TNIL;
+            lua_pop(L, 2);
+            return hit;
+        }
+        if (c->ev == SEV_FRAME) lua_pop(L, 1);
+        return true;
+    }
+    default:
+        return true;
+    }
+}
+
+/* Pushes the handler arguments for c; returns their count. arg receives the
+ * index of the event table (input / cursor), or 0. */
+static int push_args(lua_State *L, Call *c, int *arg)
+{
+    *arg = 0;
+    if (c->ev <= SEV_DRAG_END) {
+        push_event_table(L, c->ev);
+        fill_input(L, lua_gettop(L), c->in);
+        *arg = lua_gettop(L);
+        return 1;
+    }
+    switch (c->ev) {
+    case SEV_CURSOR:
+        push_event_table(L, c->ev);
+        *arg = lua_gettop(L);
+        set_int(L, *arg, "x", c->cx);
+        set_int(L, *arg, "y", c->cy);
+        set_bool(L, *arg, "valid", c->cvalid);
+        return 1;
+    case SEV_PEER_MOVED: case SEV_PEER_ADDED: case SEV_PEER_REMOVED: case SEV_COLLIDE: case SEV_SEPARATE:
+        push_peer(L, c->peer);
+        return 1;
+    case SEV_FRAME:
+        lua_pushinteger(L, c->frame + 1);
+        lua_pushstring(L, c->clip);
+        return 2;
+    case SEV_CLIP_END:
+        lua_pushstring(L, c->clip);
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static void dispatch_event(lua_State *L, Call *c)
+{
+    Script *s = c->s;
+    int base = lua_gettop(L), arg = 0;
+    int nargs = push_args(L, c, &arg); /* Built once, shared by every handler. */
+    const char *legacy = legacy_name(c->ev);
+    if (legacy) {
+        if (raw_global(L, legacy) == LUA_TFUNCTION) {
+            for (int i = 1; i <= nargs; ++i) lua_pushvalue(L, base + i);
+            lua_call(L, nargs, 0);
+        } else {
+            lua_pop(L, 1);
+        }
+    }
+    if (s->handler_count[c->ev] > 0) {
+        push_handler_list(L, c->ev);
+        int list = lua_gettop(L);
+        lua_Integer n = (lua_Integer)lua_rawlen(L, list); /* Handlers added meanwhile wait for the next event. */
+        s->depth++;
+        for (lua_Integer i = 1; i <= n; ++i) {
+            lua_rawgeti(L, list, i);
+            if (!lua_istable(L, -1) || get_bool(L, -1, "dead") || !accept(L, s, c, arg)) {
+                lua_settop(L, list);
+                continue;
+            }
+            lua_getfield(L, -1, "fn");
+            for (int k = 1; k <= nargs; ++k) lua_pushvalue(L, base + k);
+            lua_call(L, nargs, 1);
+            bool routed = c->in && !c->in->passthrough;
+            bool handled = routed && (lua_toboolean(L, -1) || (arg && get_bool(L, arg, "handled")));
+            lua_settop(L, list);
+            if (handled) {
+                c->handled = true;
+                break; /* Like a handled routed event: later handlers do not see it. */
+            }
+        }
+        s->depth--;
+    }
+    lua_settop(L, base);
+    compact_handlers(L, s);
+}
+
+/* Runs the timers that were due when the call started, earliest first. A
+ * callback that keeps adding yagp.after(0, ...) runs again next time, not in
+ * an endless loop; a repeating timer never bursts to catch up. */
+static void dispatch_timers(lua_State *L, Call *c)
+{
+    Script *s = c->s;
+    int ids[SCRIPT_MAX_TIMERS], n = 0;
+    double dues[SCRIPT_MAX_TIMERS];
+    for (int i = 0; i < s->timer_count; ++i) {
+        if (s->timers[i].due > c->now) continue;
+        int k = n++;
+        while (k > 0 && dues[k - 1] > s->timers[i].due) {
+            ids[k] = ids[k - 1];
+            dues[k] = dues[k - 1];
+            --k;
+        }
+        ids[k] = s->timers[i].id;
+        dues[k] = s->timers[i].due;
+    }
+    for (int k = 0; k < n; ++k) {
+        int i = 0;
+        while (i < s->timer_count && s->timers[i].id != ids[k]) ++i;
+        if (i == s->timer_count) continue; /* Cancelled by an earlier callback. */
+        Timer *t = &s->timers[i];
+        lua_rawgeti(L, LUA_REGISTRYINDEX, t->ref);
+        if (t->period > 0) {
+            t->due += t->period;
+            if (t->due <= c->now) t->due = c->now + t->period;
+        } else {
+            remove_timer(L, s, i); /* Before the call: the callback may add timers. */
+        }
+        lua_call(L, 0, 0);
+    }
+}
+
 /* Every entry from the host runs through here, under protected_call, so no
  * Lua error (script error, memory cap, budget) can escape to an unprotected
  * frame, where Lua would abort the process. Stack: [call, chunk?]. */
@@ -550,6 +1444,10 @@ static int dispatch(lua_State *L)
     if (c->kind == CALL_CHUNK) {
         lua_pushvalue(L, 2);
         lua_call(L, 0, 0);
+    } else if (c->kind == CALL_EVENT) {
+        dispatch_event(L, c);
+    } else if (c->kind == CALL_TIMERS) {
+        dispatch_timers(L, c);
     } else if (raw_global(L, c->fn) == LUA_TFUNCTION) {
         int nargs = 0;
         if (c->kind == CALL_DT) {
@@ -562,7 +1460,14 @@ static int dispatch(lua_State *L)
         lua_call(L, nargs, 0);
     }
     lua_settop(L, 0);
-    c->s->has_update = raw_global(L, "update") == LUA_TFUNCTION;
+    Script *s = c->s;
+    s->has_update = raw_global(L, "update") == LUA_TFUNCTION;
+    s->legacy = 0;
+    for (int i = 0; i < (int)(sizeof(LEGACY_NAMES) / sizeof(LEGACY_NAMES[0])); ++i) {
+        if (raw_global(L, LEGACY_NAMES[i]) == LUA_TFUNCTION) s->legacy |= SEV_BIT(LEGACY_EVENTS[i]);
+    }
+    lua_settop(L, 0);
+    refresh_subs(s);
     return 0;
 }
 
@@ -570,7 +1475,13 @@ static int dispatch(lua_State *L)
 static bool call_global(Script *s, int kind, const char *fn, double dt, const ScriptPeer *peer,
                         wchar_t *err, size_t err_cap)
 {
-    Call c = {s, fn, kind, dt, peer};
+    Call c;
+    memset(&c, 0, sizeof(c));
+    c.s = s;
+    c.fn = fn;
+    c.kind = kind;
+    c.dt = dt;
+    c.peer = peer;
     lua_pushcfunction(s->L, dispatch);   /* A light C function: no allocation. */
     lua_pushlightuserdata(s->L, &c);
     return protected_call(s, 1, err, err_cap);
@@ -644,6 +1555,13 @@ static int open_sandbox(lua_State *L)
 Script *script_create(const ScriptHostOps *ops, void *ctx, const char *chunk, size_t len,
                       const char *chunkname, const char *name, int id, wchar_t *err, size_t err_cap)
 {
+    return script_create_ex(ops, NULL, ctx, chunk, len, chunkname, name, id, err, err_cap);
+}
+
+Script *script_create_ex(const ScriptHostOps *ops, const ScriptHostExtOps *ext, void *ctx, const char *chunk,
+                         size_t len, const char *chunkname, const char *name, int id, wchar_t *err,
+                         size_t err_cap)
+{
     if (err && err_cap) err[0] = 0;
     Script *s = (Script *)calloc(1, sizeof(Script));
     if (!s) {
@@ -651,6 +1569,7 @@ Script *script_create(const ScriptHostOps *ops, void *ctx, const char *chunk, si
         return NULL;
     }
     s->ops = ops;
+    s->ext = ext;
     s->ctx = ctx;
     s->id = id;
     strncpy_s(s->name, sizeof(s->name), name ? name : "script", _TRUNCATE);
@@ -673,7 +1592,10 @@ Script *script_create(const ScriptHostOps *ops, void *ctx, const char *chunk, si
         goto fail;
     }
     /* [chunk] -> [dispatch, call, chunk]: inserting values does not allocate. */
-    Call run = {s, NULL, CALL_CHUNK, 0, NULL};
+    Call run;
+    memset(&run, 0, sizeof(run));
+    run.s = s;
+    run.kind = CALL_CHUNK;
     lua_pushcfunction(s->L, dispatch);
     lua_insert(s->L, -2);
     lua_pushlightuserdata(s->L, &run);
@@ -712,4 +1634,97 @@ bool script_event(Script *s, const char *fn, wchar_t *err, size_t err_cap)
 bool script_event_peer(Script *s, const char *fn, const ScriptPeer *other, wchar_t *err, size_t err_cap)
 {
     return call_global(s, CALL_PEER, fn, 0, other, err, err_cap);
+}
+
+unsigned script_subscriptions(Script *s)
+{
+    return s ? s->subs : 0;
+}
+
+/* Runs c (CALL_EVENT / CALL_TIMERS) under the budget. */
+static bool run_call(Script *s, Call *c, wchar_t *err, size_t err_cap)
+{
+    lua_pushcfunction(s->L, dispatch);
+    lua_pushlightuserdata(s->L, c);
+    return protected_call(s, 1, err, err_cap);
+}
+
+static bool run_event(Script *s, Call *c, int ev, wchar_t *err, size_t err_cap)
+{
+    if (!(s->subs & SEV_BIT(ev))) return true; /* Not subscribed: no call into Lua at all. */
+    c->s = s;
+    c->kind = CALL_EVENT;
+    c->ev = ev;
+    return run_call(s, c, err, err_cap);
+}
+
+bool script_input(Script *s, ScriptEvent ev, const ScriptInput *in, bool *handled, wchar_t *err, size_t err_cap)
+{
+    Call c;
+    memset(&c, 0, sizeof(c));
+    c.in = in;
+    if (handled) *handled = false;
+    if ((unsigned)ev > SEV_DRAG_END) return true;
+    bool ok = run_event(s, &c, ev, err, err_cap);
+    if (handled) *handled = ok && c.handled && !in->passthrough;
+    return ok;
+}
+
+bool script_cursor(Script *s, int x, int y, bool valid, wchar_t *err, size_t err_cap)
+{
+    Call c;
+    memset(&c, 0, sizeof(c));
+    c.cx = x;
+    c.cy = y;
+    c.cvalid = valid;
+    return run_event(s, &c, SEV_CURSOR, err, err_cap);
+}
+
+bool script_peer_event(Script *s, ScriptEvent ev, const ScriptPeer *p, wchar_t *err, size_t err_cap)
+{
+    Call c;
+    memset(&c, 0, sizeof(c));
+    c.peer = p;
+    if (ev != SEV_PEER_MOVED && ev != SEV_PEER_ADDED && ev != SEV_PEER_REMOVED && ev != SEV_COLLIDE &&
+        ev != SEV_SEPARATE) return true;
+    return run_event(s, &c, ev, err, err_cap);
+}
+
+bool script_clip_event(Script *s, ScriptEvent ev, const char *clip, int frame, wchar_t *err, size_t err_cap)
+{
+    Call c;
+    memset(&c, 0, sizeof(c));
+    c.clip = clip ? clip : "main";
+    c.frame = frame;
+    if (ev != SEV_FRAME && ev != SEV_CLIP_END) return true;
+    return run_event(s, &c, ev, err, err_cap);
+}
+
+bool script_plain_event(Script *s, ScriptEvent ev, wchar_t *err, size_t err_cap)
+{
+    Call c;
+    memset(&c, 0, sizeof(c));
+    if (ev != SEV_MOVED && ev != SEV_SCREENS_CHANGED && ev != SEV_TRANSFORM_END) return true;
+    return run_event(s, &c, ev, err, err_cap);
+}
+
+double script_next_timer(Script *s)
+{
+    double best = -1;
+    for (int i = 0; s && i < s->timer_count; ++i) {
+        if (best < 0 || s->timers[i].due < best) best = s->timers[i].due;
+    }
+    return best;
+}
+
+bool script_run_timers(Script *s, double now, wchar_t *err, size_t err_cap)
+{
+    double next = script_next_timer(s);
+    if (next < 0 || next > now) return true;
+    Call c;
+    memset(&c, 0, sizeof(c));
+    c.s = s;
+    c.kind = CALL_TIMERS;
+    c.now = now;
+    return run_call(s, &c, err, err_cap);
 }

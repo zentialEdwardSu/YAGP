@@ -39,7 +39,25 @@ typedef struct GifStream {
     uint32_t key_rgb;
     int key_tolerance;
     uint8_t key_mask[256]; /* Per-frame: 1 = palette index is keyed out. */
+    /* The frame the last gif_stream_next decoded: file offset of its first
+     * record (what gif_stream_seek takes), its rect in source pixels
+     * {l, t, r, b}, its disposal method and whether it has a transparent index. */
+    size_t frame_offset;
+    int frame_rect[4];
+    int frame_disposal;
+    int frame_transparent;
 } GifStream;
+
+/* Saved decoder position + canvas, to jump back to a frame without decoding
+ * from the start again (sub-range loops). Owns its buffers. */
+typedef struct GifSnapshot {
+    size_t pos;
+    int out_w, out_h;
+    uint8_t *bgra;
+    uint8_t *backup;       /* Only when the frame after it restores (disposal 3). */
+    int old_disposal;
+    int old_box[4];
+} GifSnapshot;
 
 /* Map the file and allocate a full-size compositing canvas. 0 on success. */
 int gif_stream_open(GifStream *g, const wchar_t *path);
@@ -59,6 +77,16 @@ int gif_stream_set_output_size(GifStream *g, int out_w, int out_h);
 /* Maps a source-pixel box [l, r) x [t, b) to the canvas box {l, t, r, b} of the
  * pixels that sample it (empty when l >= r or t >= b). */
 void gif_stream_map_box(const GifStream *g, int l, int t, int r, int b, int out[4]);
+/* Continues decoding at offset (a frame_offset reported earlier for this
+ * file) with a cleared canvas and no pending disposal, as if that frame were
+ * the first one. Only gives the right pixels from a keyframe on (see
+ * frame_cache.h). 0 on success. */
+int gif_stream_seek(GifStream *g, size_t offset);
+/* Saves / restores the state right after the last decoded frame. restore
+ * fails (-1) if the canvas size changed since the save. */
+int gif_stream_snapshot_save(const GifStream *g, GifSnapshot *s);
+int gif_stream_snapshot_restore(GifStream *g, const GifSnapshot *s);
+void gif_stream_snapshot_free(GifSnapshot *s);
 /* Parses "#RRGGBB", "RRGGBB" or "#RGB". Returns 0 on success. */
 int gif_parse_hex_color(const wchar_t *text, uint32_t *rgb);
 

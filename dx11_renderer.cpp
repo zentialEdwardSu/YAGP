@@ -26,9 +26,9 @@ struct RenderSurface {
     ID3D11Texture2D *backbuffer = nullptr;
     IDCompositionTarget *target = nullptr;
     IDCompositionVisual *visual = nullptr;
+    IDCompositionMatrixTransform *transform = nullptr; /* Created on first use. */
+    IDCompositionEffectGroup *effect = nullptr;        /* Opacity; created on first use. */
     int width = 0, height = 0;
-    float scale = 1.0f;
-    bool flip_x = false;
     /* Flip-sequential keeps buffer contents, and the back buffer holds the
      * frame from two presents ago. A partial update must therefore also cover
      * the previous dirty rect. full_pending counts presents that must still be
@@ -36,8 +36,6 @@ struct RenderSurface {
     RECT prev_dirty = {};
     int full_pending = 2;
 };
-
-static bool apply_transform(RenderSurface *s);
 
 static bool is_device_loss(HRESULT hr)
 {
@@ -183,6 +181,8 @@ extern "C" void render_surface_destroy(RenderSurface *s)
         s->target->SetRoot(nullptr);
         if (s->dev && s->dev->composition) s->dev->composition->Commit();
     }
+    release(s->effect);
+    release(s->transform);
     release(s->visual);
     release(s->target);
     release(s->backbuffer);
@@ -240,34 +240,72 @@ extern "C" bool render_surface_resize(RenderSurface *s, int width, int height)
     s->width = width;
     s->height = height;
     s->full_pending = 2;
-    if (!acquire_backbuffer(s)) return false;
-    return !s->flip_x || apply_transform(s); /* The mirror offset depends on the width. */
+    return acquire_backbuffer(s);
 }
 
-static bool apply_transform(RenderSurface *s)
+/* One cubic segment from a to b over duration, then holds b. */
+static IDCompositionAnimation *make_animation(RenderDevice *dev, double a, double b, double duration,
+                                              const double c[4])
 {
-    D2D_MATRIX_3X2_F m = {};
-    m._11 = s->flip_x ? -s->scale : s->scale;
-    m._22 = s->scale;
-    /* Mirror around the vertical centre: x' = (w - x) * scale. */
-    if (s->flip_x) m._31 = (float)s->width * s->scale;
-    HRESULT hr = s->visual->SetTransform(m);
-    if (SUCCEEDED(hr)) hr = s->dev->composition->Commit();
-    if (FAILED(hr)) { note_failure(s->dev, hr); return false; }
+    IDCompositionAnimation *anim = nullptr;
+    if (FAILED(dev->composition->CreateAnimation(&anim))) return nullptr;
+    double d = b - a, t1 = duration, t2 = t1 * t1, t3 = t2 * t1;
+    HRESULT hr = anim->AddCubic(0.0, (float)(a + d * c[0]), (float)(d * c[1] / t1), (float)(d * c[2] / t2),
+                                (float)(d * c[3] / t3));
+    if (SUCCEEDED(hr)) hr = anim->End(duration, (float)b);
+    if (FAILED(hr)) release(anim);
+    return anim;
+}
+
+extern "C" bool render_surface_set_matrix(RenderSurface *s, const double to[6], const double *from,
+                                          double duration, const double cubic[4])
+{
+    if (!s || s->dev->lost) return false;
+    RenderDevice *dev = s->dev;
+    HRESULT hr = S_OK;
+    if (!s->transform) {
+        hr = dev->composition->CreateMatrixTransform(&s->transform);
+        if (SUCCEEDED(hr)) hr = s->visual->SetTransform(s->transform);
+        if (FAILED(hr)) { release(s->transform); note_failure(dev, hr); return false; }
+    }
+    if (duration <= 0 || !from || !cubic) {
+        D2D_MATRIX_3X2_F m = {};
+        m._11 = (float)to[0]; m._12 = (float)to[1];
+        m._21 = (float)to[2]; m._22 = (float)to[3];
+        m._31 = (float)to[4]; m._32 = (float)to[5];
+        hr = s->transform->SetMatrix(m); /* Also replaces any running animation. */
+    } else {
+        for (int i = 0; i < 6 && SUCCEEDED(hr); ++i) {
+            IDCompositionAnimation *anim = make_animation(dev, from[i], to[i], duration, cubic);
+            hr = anim ? s->transform->SetMatrixElement(i / 2, i % 2, anim) : E_OUTOFMEMORY;
+            release(anim); /* The transform keeps its own reference. */
+        }
+    }
+    if (SUCCEEDED(hr)) hr = dev->composition->Commit();
+    if (FAILED(hr)) { note_failure(dev, hr); return false; }
     return true;
 }
 
-extern "C" bool render_surface_set_scale(RenderSurface *s, float scale)
+extern "C" bool render_surface_set_opacity(RenderSurface *s, double to, double from, double duration,
+                                           const double cubic[4])
 {
-    if (!s || scale <= 0.0f) return false;
-    s->scale = scale;
-    return apply_transform(s);
-}
-
-extern "C" bool render_surface_set_flip(RenderSurface *s, bool flip_x)
-{
-    if (!s) return false;
-    if (s->flip_x == flip_x) return true;
-    s->flip_x = flip_x;
-    return apply_transform(s);
+    if (!s || s->dev->lost) return false;
+    RenderDevice *dev = s->dev;
+    HRESULT hr = S_OK;
+    if (!s->effect) {
+        if (to >= 1.0 && duration <= 0) return true; /* Never needed one. */
+        hr = dev->composition->CreateEffectGroup(&s->effect);
+        if (SUCCEEDED(hr)) hr = s->visual->SetEffect(s->effect);
+        if (FAILED(hr)) { release(s->effect); note_failure(dev, hr); return false; }
+    }
+    if (duration <= 0 || !cubic) {
+        hr = s->effect->SetOpacity((float)to);
+    } else {
+        IDCompositionAnimation *anim = make_animation(dev, from, to, duration, cubic);
+        hr = anim ? s->effect->SetOpacity(anim) : E_OUTOFMEMORY;
+        release(anim);
+    }
+    if (SUCCEEDED(hr)) hr = dev->composition->Commit();
+    if (FAILED(hr)) { note_failure(dev, hr); return false; }
+    return true;
 }

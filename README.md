@@ -197,14 +197,6 @@ python tests/test_frame_cache.py out\Release\gif_dump.exe
 out\Release\script_test.exe
 ```
 
-没有 Windows 时，解码器、帧缓存和 Lua 宿主也可以在 Linux 上本地编译运行：`tests/posix` 提供了一个很小的 Win32 替身，在 UBSan 和保护页分配器下运行，并自带一个不依赖第三方库的 GIF 生成器和参考合成器：
-
-```sh
-make -C tests/posix check LUA_DIR=<lua-5.4.7> GIFLIB_DIR=<giflib-5.2.2>
-python3 tests/posix/gifgen.py diff <旧 gif_dump> <新 gif_dump>  # 输出逐字节一致
-python3 tests/posix/gifgen.py bench <gif_dump>...              # 冷缓存构建耗时
-```
-
 解码测试把合成后的帧和帧延时与 Pillow 的结果对比，覆盖 disposal 1/2/3、隔行扫描、用 `gif_stream_restart` 循环、色键，以及拒绝格式错误的十六进制颜色。它还会把每个用例解码到缩小的画布（一半、五分之一、奇数尺寸 37×29、1×1），与原尺寸参考帧按"取中心最近像素"采样的结果逐像素对比。
 
 `script_test` 用一个假窗口、一个假鼠标和一个假的双显示器布局（尺寸不同、上下错开，中间有空隙）运行 Lua 宿主。它检查：

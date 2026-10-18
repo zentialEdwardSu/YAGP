@@ -1,5 +1,6 @@
 -- 跟随鼠标：GIF 中心向鼠标靠拢，离得越远走得越快，到达 STOP 距离内就停下。
 -- 鼠标在其他显示器上时也会跟过去；遇到显示器之间的空隙会沿边缘滑行绕过。
+-- 到达后停止逐帧更新，鼠标再次移动时（"cursor" 事件）才继续，所以鼠标不动时不运行任何代码。
 -- 坐标均为物理像素。
 
 SPEED = 260       -- 最大速度（像素/秒）
@@ -21,13 +22,13 @@ local function clamp(x, y, work)
   return x, y
 end
 
-function update(dt)
+local function step(dt)
   local mx, my, valid = yagp.cursor()
-  if not valid then return end -- 锁屏等情况下读不到鼠标
+  if not valid then update = nil return end -- 锁屏等情况下读不到鼠标：等它再动
   local cx, cy = yagp.center()
   local dx, dy = mx - cx, my - cy
   local d = math.sqrt(dx * dx + dy * dy)
-  if d <= STOP then return end
+  if d <= STOP + 0.5 then update = nil return end -- 到了（速度随距离减小，只会无限接近 STOP）
   local step = math.min(SPEED, (d - STOP) * EASE) * dt
   if step > d - STOP then step = d - STOP end
   local x, y = yagp.pos()
@@ -36,7 +37,7 @@ function update(dt)
   if not yagp.fits(nx, ny) then
     if yagp.fits(nx, y) then ny = y
     elseif yagp.fits(x, ny) then nx = x
-    else return end
+    else update = nil return end -- 被空隙挡住：等鼠标换个位置
   end
   yagp.set_pos(nx, ny)
   face(dx)
@@ -47,7 +48,11 @@ local function reset()
   if not yagp.fits(x, y) then yagp.set_pos(clamp(x, y, yagp.monitor().work)) end
 end
 
-on_moved = reset
-on_screens_changed = reset
+local function wake() update = step end
+yagp.on("cursor", wake, {min_move = 4})
+
+on_moved = function() reset() wake() end
+on_screens_changed = on_moved
 
 reset()
+update = step

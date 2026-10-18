@@ -72,6 +72,15 @@ def ref_frames(path, key):
     return out
 
 
+def total_ms(path):
+    im = Image.open(path)
+    t = 0
+    for i in range(im.n_frames):
+        im.seek(i)
+        t += im.info.get("duration", 100) or 100
+    return t
+
+
 def box(a, b):
     l, t, r, btm = W, H, 0, 0
     for y in range(H):
@@ -102,7 +111,8 @@ def run(exe, gif, cache_dir, key, out):
         w, h, n, disk = struct.unpack("<4i", f.read(16))
         dirty = [struct.unpack("<4H", f.read(8)) for _ in range(n)]
         opaque = struct.unpack("<4H", f.read(8))
-    return w, h, n, disk, dirty, opaque
+        frames = [struct.unpack("<3I", f.read(12)) for _ in range(n)]
+    return w, h, n, disk, dirty, opaque, frames
 
 
 def main():
@@ -126,7 +136,12 @@ def main():
             want_opaque = opaque_box(frames)
             errors = []
             for attempt, want_disk in ((1, 0), (2, 1)):  # build, then load from disk
-                w, h, cn, disk, dirty, opaque = run(exe, gif, cache, key, out)
+                w, h, cn, disk, dirty, opaque, index = run(exe, gif, cache, key, out)
+                offsets = [o for o, _, _ in index]
+                if offsets != sorted(set(offsets)) or not index or not index[0][2] & 1:
+                    errors.append(f"run {attempt}: bad frame index {index}")
+                if sum(dl for _, dl, _ in index) != total_ms(gif):
+                    errors.append(f"run {attempt}: delays {[dl for _, dl, _ in index]}")
                 if tuple(opaque) != want_opaque:
                     errors.append(f"run {attempt}: opaque {opaque} != {want_opaque}")
                 if (w, h, cn) != (W, H, n):
@@ -142,6 +157,15 @@ def main():
         os.utime(gif, (st.st_atime, st.st_mtime + 5))
         report(run(exe, gif, cache, None, out)[3] == 0, "rebuilds after GIF mtime changes")
         report(run(exe, gif, cache, None, out)[3] == 1, "reloads rebuilt cache")
+        # Opaque full-frame GIF: every frame is a keyframe; transparent
+        # disposal-1 sprites: only frame 0 is.
+        fr = [pal(Image.new("P", (W, H), 1 + i % 2)) for i in range(3)]
+        full = os.path.join(d, "full.gif")
+        fr[0].save(full, save_all=True, append_images=fr[1:], duration=40, loop=0, optimize=False)
+        flags = [fl & 1 for _, _, fl in run(exe, full, cache, None, out)[6]]
+        report(flags == [1, 1, 1], f"opaque full frames are keyframes {flags}")
+        flags = [fl & 1 for _, _, fl in run(exe, gif, cache, None, out)[6]]
+        report(flags[0] == 1, f"frame 0 is a keyframe {flags}")
         # An older cache version (here: v2) must be rebuilt, not trusted.
         for f in os.listdir(cache):
             with open(os.path.join(cache, f), "r+b") as fh:

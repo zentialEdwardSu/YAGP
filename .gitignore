@@ -2,4 +2,3 @@ build/
 out/
 out-en/
 *.aps
-tests/posix/build/

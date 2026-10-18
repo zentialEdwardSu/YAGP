@@ -319,17 +319,6 @@ python tests/test_frame_cache.py out\Release\gif_dump.exe
 out\Release\script_test.exe
 ```
 
-Without Windows, the decoder, frame cache and Lua host also build and run
-natively on Linux against a small Win32 stand-in (`tests/posix`), under UBSan
-and a guard-page allocator, with a dependency-free GIF generator and reference
-compositor:
-
-```sh
-make -C tests/posix check LUA_DIR=<lua-5.4.7> GIFLIB_DIR=<giflib-5.2.2>
-python3 tests/posix/gifgen.py diff <old gif_dump> <new gif_dump>  # byte-identical output
-python3 tests/posix/gifgen.py bench <gif_dump>...                 # cold cache build time
-```
-
 The decoder test compares composited frames and delays against Pillow,
 covering disposal 1/2/3, interlacing, looping via `gif_stream_restart`, colour
 keying, and rejection of malformed hex colours. It also decodes every case into

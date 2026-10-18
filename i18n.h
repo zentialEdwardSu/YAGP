@@ -59,6 +59,7 @@
 #define TXT_PRESET_BOUNCE          L"Bounce off edges"
 #define TXT_PRESET_FOLLOW          L"Follow mouse"
 #define TXT_PRESET_FLEE            L"Avoid mouse"
+#define TXT_PRESET_LOOK            L"Look at mouse (direction clips)"
 
 /* ---- notifications -------------------------------------------------------- */
 #define TXT_CLICKTHROUGH_ON_TITLE  L"Click-through enabled"
@@ -115,6 +116,17 @@
 #define TXT_U8_OUT_OF_MEMORY       "out of memory"
 #define TXT_U8_LUA_STATE           "cannot create a Lua state"
 #define TXT_U8_NO_GC               "__gc metamethods are not allowed (finalizers cannot be interrupted)"
+#define TXT_U8_BAD_OPTION          "invalid option '%s'"
+#define TXT_U8_UNKNOWN_EVENT       "unknown event '%s'"
+#define TXT_U8_TOO_MANY            "too many handlers or timers (at most %d)"
+#define TXT_U8_BAD_CLIP_NAME       "invalid clip name (1-31 bytes, not 'main')"
+#define TXT_U8_BAD_RANGE           "value out of range"
+#define TXT_U8_BAD_MATRIX          "invalid transform (each part within +-8, offsets within +-4096, not degenerate)"
+#define TXT_U8_UNAVAILABLE         "not available"
+#define TXT_U8_BAD_CLIP_PATH       "invalid clip path (a .gif file in the main GIF's folder or a subfolder)"
+#define TXT_U8_CLIP_OPEN           "cannot open the clip (missing, invalid, or larger than the pixel budget)"
+#define TXT_U8_NO_SUCH_CLIP        "no clip named '%s'"
+#define TXT_U8_TOO_MANY_CLIPS      "too many clips (at most %d)"
 
 #else /* zh_CN (default) */
 
@@ -161,6 +173,7 @@
 #define TXT_PRESET_BOUNCE          L"边缘反弹"
 #define TXT_PRESET_FOLLOW          L"跟随鼠标"
 #define TXT_PRESET_FLEE            L"躲避鼠标"
+#define TXT_PRESET_LOOK            L"看向鼠标（方向动画）"
 
 /* ---- notifications -------------------------------------------------------- */
 #define TXT_CLICKTHROUGH_ON_TITLE  L"已开启鼠标穿透"
@@ -217,6 +230,17 @@
 #define TXT_U8_OUT_OF_MEMORY       "内存不足"
 #define TXT_U8_LUA_STATE           "无法创建 Lua 状态"
 #define TXT_U8_NO_GC               "不允许使用 __gc 元方法（终结器无法被中断）"
+#define TXT_U8_BAD_OPTION          "无效的选项 '%s'"
+#define TXT_U8_UNKNOWN_EVENT       "未知事件 '%s'"
+#define TXT_U8_TOO_MANY            "事件处理函数或定时器过多（最多 %d 个）"
+#define TXT_U8_BAD_CLIP_NAME       "无效的 clip 名称（1-31 字节，不能是 'main'）"
+#define TXT_U8_BAD_RANGE           "数值超出范围"
+#define TXT_U8_BAD_MATRIX          "无效的变换（各分量在 ±8 内，平移在 ±4096 内，且不能退化）"
+#define TXT_U8_UNAVAILABLE         "不可用"
+#define TXT_U8_BAD_CLIP_PATH       "无效的 clip 路径（只能是主 GIF 所在目录或其子目录里的 .gif 文件）"
+#define TXT_U8_CLIP_OPEN           "无法打开 clip（不存在、格式无效或超过像素预算）"
+#define TXT_U8_NO_SUCH_CLIP        "没有名为 '%s' 的 clip"
+#define TXT_U8_TOO_MANY_CLIPS      "clip 过多（最多 %d 个）"
 
 #endif
 

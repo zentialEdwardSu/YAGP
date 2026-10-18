@@ -83,6 +83,22 @@ def make_key_case(d):
     return path
 
 
+def make_full_case(d):
+    """Mixed keyframes: opaque full frames between small transparent
+    disposal-1 and disposal-3 sprites, so seeks start mid-file."""
+    path = os.path.join(d, "mixed.gif")
+    frames, disposal = [], []
+    for i in range(8):
+        im = Image.new("P", (W, H), 2 if i % 3 == 0 else 0)
+        im.putpalette([0, 0, 0, 255, 0, 0, 30, 60, 90, 200, 200, 0] + [0, 0, 0] * 252)
+        ImageDraw.Draw(im).rectangle((4 + i * 6, 4 + i * 3, 14 + i * 6, 14 + i * 3), fill=1 + (i % 2) * 2)
+        frames.append(im)
+        disposal.append(3 if i % 3 == 1 else 1)
+    frames[0].save(path, save_all=True, append_images=frames[1:], duration=40, loop=0,
+                   transparency=0, disposal=disposal, optimize=False)
+    return path
+
+
 def sample_nearest(px, w, h, ow, oh):
     """RGBA bytes w x h -> ow x oh, source pixel floor((i + 0.5) * src / dst)."""
     xs = [min((2 * i + 1) * w // (2 * ow), w - 1) for i in range(ow)]
@@ -156,6 +172,32 @@ def main():
                 for e in errors[:5]:
                     print("     " + e)
                 failures += bool(errors)
+
+        # Seeking: every frame decoded from its nearest keyframe, and every
+        # frame decoded after restoring a snapshot, must equal the reference.
+        seek_cases = list(make_cases(d)) + [make_key_case(d), make_full_case(d)]
+        for gif in seek_cases:
+            cache = os.path.join(d, "cache")
+            out = os.path.join(d, "out.bin")
+            subprocess.run([exe, "--seek", gif, out, cache], check=True)
+            with open(out, "rb") as f:
+                w, h, n = struct.unpack("<3i", f.read(12))
+                frames = []
+                for _ in range(n):
+                    f.read(4)
+                    frames.append(f.read(w * h * 4))
+            ref = reference(gif)
+            errors = []
+            if n != 2 * len(ref):
+                errors.append(f"{n} frames, expected {2 * len(ref)}")
+            for i, px in enumerate(frames):
+                msg = compare(px, ref[i % len(ref)], w, h)
+                if msg:
+                    errors.append(f"{'seek' if i < len(ref) else 'snapshot'} frame {i % len(ref)}: {msg}")
+            print(("FAIL " if errors else "ok   ") + f"seek {os.path.basename(gif)}")
+            for e in errors[:5]:
+                print("     " + e)
+            failures += bool(errors)
 
         gif = make_key_case(d)
         for arg, rgb in (("#00FF00", (0, 255, 0)), ("0f0", (0, 255, 0)), ("#00ff00", (0, 255, 0))):

@@ -9,12 +9,13 @@
 #include <string.h>
 
 #define CACHE_MAGIC 0x31434759u /* "YGC1" little-endian */
-#define CACHE_VERSION 3 /* v2: mask removed; v3: opaque box */
+#define CACHE_VERSION 4 /* v2: mask removed; v3: opaque box; v4: frame index */
 #define MAX_CACHE_FRAMES 65535
 
 /* On-disk layout (little-endian):
  *   CacheHeader
  *   uint16_t dirty[frame_count][4]
+ *   FrameInfo frames[frame_count]
  * Every field that can change the result is part of the header and is
  * compared on load, so a stale file is simply rebuilt. */
 #pragma pack(push, 1)
@@ -35,6 +36,7 @@ typedef struct CacheHeader {
 void frame_cache_free(FrameCache *c)
 {
     free(c->dirty);
+    free(c->frames);
     memset(c, 0, sizeof(*c));
 }
 
@@ -129,7 +131,9 @@ static bool load(const wchar_t *file, const CacheHeader *want, FrameCache *out)
     if (ok) {
         size_t dsize = (size_t)h.frame_count * sizeof(*out->dirty);
         out->dirty = (uint16_t (*)[4])malloc(dsize);
-        ok = out->dirty && read_exact(f, out->dirty, dsize);
+        size_t fsize = (size_t)h.frame_count * sizeof(*out->frames);
+        out->frames = (FrameInfo *)malloc(fsize);
+        ok = out->dirty && out->frames && read_exact(f, out->dirty, dsize) && read_exact(f, out->frames, fsize);
         /* Reject trailing junk / truncated writes. */
         LARGE_INTEGER size, pos = {0};
         ok = ok && GetFileSizeEx(f, &size) && SetFilePointerEx(f, pos, &pos, FILE_CURRENT) &&
@@ -137,6 +141,12 @@ static bool load(const wchar_t *file, const CacheHeader *want, FrameCache *out)
         for (int i = 0; ok && i < h.frame_count; ++i) {
             const uint16_t *d = out->dirty[i];
             ok = d[2] <= h.width && d[3] <= h.height && (d[0] >= d[2] || (d[0] < d[2] && d[1] < d[3]));
+        }
+        /* Offsets must point into the file, in order: gif_stream_seek trusts them. */
+        for (int i = 0; ok && i < h.frame_count; ++i) {
+            const FrameInfo *fi = &out->frames[i];
+            ok = fi->offset >= 13 && fi->offset < h.file_size &&
+                 (i == 0 ? (fi->flags & FRAME_KEYFRAME) != 0 : fi->offset > out->frames[i - 1].offset);
         }
         const uint16_t *o = h.opaque;
         ok = ok && (o[0] >= o[2] || (o[2] <= h.width && o[3] <= h.height && o[1] < o[3]));
@@ -164,7 +174,8 @@ static void save(const wchar_t *dir, const wchar_t *file, const CacheHeader *h, 
     HANDLE f = CreateFileW(tmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (f == INVALID_HANDLE_VALUE) return;
     bool ok = write_exact(f, h, sizeof(*h)) &&
-              write_exact(f, c->dirty, (size_t)c->frame_count * sizeof(*c->dirty));
+              write_exact(f, c->dirty, (size_t)c->frame_count * sizeof(*c->dirty)) &&
+              write_exact(f, c->frames, (size_t)c->frame_count * sizeof(*c->frames));
     CloseHandle(f);
     /* A cache is disposable: no flush, just an atomic rename. */
     if (!ok || !MoveFileExW(tmp, file, MOVEFILE_REPLACE_EXISTING)) DeleteFileW(tmp);
@@ -238,8 +249,10 @@ static bool build(const wchar_t *path, bool key_enabled, uint32_t key_rgb, int k
     uint8_t *first = (uint8_t *)malloc(canvas);
     int cap = 64;
     out->dirty = (uint16_t (*)[4])malloc((size_t)cap * sizeof(*out->dirty));
-    bool ok = prev && first && out->dirty;
+    out->frames = (FrameInfo *)malloc((size_t)cap * sizeof(*out->frames));
+    bool ok = prev && first && out->dirty && out->frames;
     int n = 0;
+    bool cleared = true; /* The canvas is blank before the next frame. */
     int ol = g.width, ot = g.height, orr = 0, ob = 0;
     const Region full = {0, 0, g.width, g.height};
     while (ok) {
@@ -250,9 +263,23 @@ static bool build(const wchar_t *path, bool key_enabled, uint32_t key_rgb, int k
         if (n == cap) {
             cap *= 2;
             uint16_t (*grown)[4] = (uint16_t (*)[4])realloc(out->dirty, (size_t)cap * sizeof(*out->dirty));
-            if (!grown) { ok = false; break; }
-            out->dirty = grown;
+            if (grown) out->dirty = grown;
+            FrameInfo *fgrown = grown ? (FrameInfo *)realloc(out->frames, (size_t)cap * sizeof(*out->frames)) : NULL;
+            if (!fgrown) { ok = false; break; }
+            out->frames = fgrown;
         }
+        /* Keyframe: decoding can start here on a blank canvas and give the same
+         * pixels (and the same state for the frames after it). True when the
+         * canvas was blank anyway, or when this frame overwrites every pixel
+         * and does not restore (disposal 3 would bring the unknown old canvas
+         * back). */
+        const int *fr = g.frame_rect;
+        bool whole = fr[0] == 0 && fr[1] == 0 && fr[2] == g.width && fr[3] == g.height;
+        FrameInfo *fi = &out->frames[n];
+        fi->offset = (uint32_t)g.frame_offset;
+        fi->delay_ms = (uint32_t)g.delay_ms;
+        fi->flags = cleared || (whole && !g.frame_transparent && g.frame_disposal != 3) ? FRAME_KEYFRAME : 0;
+        cleared = whole && g.frame_disposal == 2;
         if (n == 0) {
             grow_opaque(g.bgra, g.width, full, &ol, &ot, &orr, &ob);
             memcpy(first, g.bgra, canvas);

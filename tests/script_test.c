@@ -1,7 +1,10 @@
 /* Lua host + preset regression test. Runs script.c against a fake window and a
  * fake monitor layout; exits non-zero on the first failed check.
  *   cmake --build build --target script_test && build\script_test.exe */
+#include "clip_path.h"
 #include "contacts.h"
+#include "input_fsm.h"
+#include "transform.h"
 #include "i18n.h"
 #include "monitors.h"
 #include "script.h"
@@ -118,6 +121,14 @@ static void set_mouse(FakeWin *w, int x, int y)
     w->mouse.x = x;
     w->mouse.y = y;
     w->mouse_ok = true;
+}
+
+/* Moves the fake cursor and tells s, like the host's mouse hook does. */
+static void move_mouse(Script *s, FakeWin *w, int x, int y)
+{
+    wchar_t err[512];
+    set_mouse(w, x, y);
+    if (s && !script_cursor(s, x, y, true, err, 512)) printf("     cursor event: %ls\n", err);
 }
 
 static double center_dist(const FakeWin *w)
@@ -443,15 +454,16 @@ static void test_presets(void)
         double before_x = w.x;
         run(s, 60, &w, ok_fits, NULL, "follow idle");
         CHECK(fabs(w.x - before_x) < 0.01, "follow jitters inside STOP");
+        CHECK(!script_has_update(s), "follow keeps ticking after arriving");
         /* Mouse on the second monitor: follows across without entering the gap. */
-        set_mouse(&w, 2600, 700);
+        move_mouse(s, &w, 2600, 700);
         run(s, 1200, &w, ok_fits, NULL, "follow cross");
         CHECK(w.x >= 1920, "follow did not cross to monitor 2: (%g, %g)", w.x, w.y);
         /* Mouse in the gap above monitor 2: slides along the edge, stays on screen. */
-        set_mouse(&w, 2500, 50);
+        move_mouse(s, &w, 2500, 50);
         run(s, 1200, &w, ok_fits, NULL, "follow gap");
         /* Mouse off every screen edge: clamps, no error. */
-        set_mouse(&w, -5000, -5000);
+        move_mouse(s, &w, -5000, -5000);
         run(s, 1200, &w, ok_fits, NULL, "follow far");
         script_destroy(s);
     }
@@ -463,14 +475,14 @@ static void test_presets(void)
     s = load_preset(&w, "flee.lua", NULL, NULL, err);
     CHECK(s, "flee: %ls", err);
     if (s) {
-        set_mouse(&w, 950, 540); /* Right on top of it. */
+        move_mouse(s, &w, 950, 540); /* Right on top of it. */
         run(s, 120, &w, ok_in_rect, &work, "flee");
         CHECK(center_dist(&w) > 150, "flee did not get away: %g", center_dist(&w));
         /* Keep chasing it into the top-left corner. It may run back there after
          * each escape, but must never stay cornered for long. */
         int cornered = 0, longest = 0, escapes = 0;
         for (int i = 0; i < 600; ++i) {
-            set_mouse(&w, (int)(w.x + w.w / 2.0) + 30, (int)(w.y + w.h / 2.0) + 30);
+            move_mouse(s, &w, (int)(w.x + w.w / 2.0) + 30, (int)(w.y + w.h / 2.0) + 30);
             double px = w.x;
             if (!script_update(s, 1.0 / 60, err, 512)) { CHECK(false, "flee chase: %ls", err); break; }
             if (!inside(&w, &work)) { CHECK(false, "flee left the work area: (%g, %g)", w.x, w.y); break; }
@@ -481,7 +493,7 @@ static void test_presets(void)
         CHECK(escapes > 0, "flee never escaped the corner");
         CHECK(longest <= 30, "flee stayed cornered for %d ticks", longest);
         /* Mouse gone: drifts back home (900, 500). */
-        set_mouse(&w, 1900, 1030);
+        move_mouse(s, &w, 1900, 1030);
         run(s, 60 * 60, &w, ok_in_rect, &work, "flee return");
         CHECK(fabs(w.x - 900) < 1 && fabs(w.y - 500) < 1, "flee did not return home: (%g, %g)", w.x, w.y);
         /* Unreadable cursor: stays still. */
@@ -489,6 +501,11 @@ static void test_presets(void)
         double hx = w.x;
         run(s, 60, &w, ok_in_rect, &work, "flee no mouse");
         CHECK(w.x == hx, "flee moved without a cursor");
+        /* Settled at home with the mouse far away: no per-tick work at all. */
+        CHECK(!script_has_update(s), "flee keeps ticking at home");
+        w.mouse_ok = true;
+        move_mouse(s, &w, 950, 540); /* Back on top of it: wakes up. */
+        CHECK(script_has_update(s), "flee did not wake on cursor_near");
         script_destroy(s);
     }
 }
@@ -996,6 +1013,524 @@ static void test_robustness(void)
     script_destroy(s);
 }
 
+/* ---- yagp.on / off, routed input, timers, ext ops -------------------------- */
+
+typedef struct FakeExt {
+    unsigned subs;
+    int subs_calls;
+    double now;
+    char loaded[8][32];
+    int loaded_n;
+    char playing[32];
+    ScriptPlay last_play;
+    int seek_to;
+    double matrix[6];
+    bool matrix_reset;
+    double matrix_dur;
+    int cursor, draggable, clickthrough;
+    double opacity;
+} FakeExt;
+static FakeExt s_ext;
+
+static bool x_load_clip(void *ctx, const char *name, const char *rel, char *err, size_t cap)
+{
+    (void)ctx;
+    if (strstr(rel, "missing")) {
+        snprintf(err, cap, "no such file: %s", rel);
+        return false;
+    }
+    strncpy_s(s_ext.loaded[s_ext.loaded_n++ % 8], 32, name, _TRUNCATE);
+    return true;
+}
+static void x_unload_clip(void *ctx, const char *name) { (void)ctx; (void)name; }
+static const uint32_t s_delays[3] = {100, 200, 300};
+static bool x_clip_info(void *ctx, const char *name, ScriptClipInfo *out)
+{
+    (void)ctx;
+    if (strcmp(name, "nope") == 0) return false;
+    out->w = 40;
+    out->h = 20;
+    out->frames = 3;
+    out->duration = 0.6;
+    out->delays = s_delays;
+    return true;
+}
+static bool x_play(void *ctx, const char *name, const ScriptPlay *p, char *err, size_t cap)
+{
+    (void)ctx;
+    if (strcmp(name, "nope") == 0) {
+        snprintf(err, cap, "no clip named '%s'", name);
+        return false;
+    }
+    strncpy_s(s_ext.playing, 32, name, _TRUNCATE);
+    s_ext.last_play = *p;
+    return true;
+}
+static bool x_seek(void *ctx, int frame) { (void)ctx; s_ext.seek_to = frame; return frame < 3; }
+static void x_get_frame(void *ctx, const char **name, int *frame, int *frames)
+{
+    (void)ctx;
+    *name = s_ext.playing[0] ? s_ext.playing : "main";
+    *frame = 1;
+    *frames = 3;
+}
+static void x_set_speed(void *ctx, double v) { (void)ctx; (void)v; }
+static void x_set_playing(void *ctx, bool v) { (void)ctx; (void)v; }
+static bool x_set_matrix(void *ctx, const double *m, double d, int e)
+{
+    (void)ctx; (void)e;
+    s_ext.matrix_reset = m == NULL;
+    if (m) memcpy(s_ext.matrix, m, sizeof(s_ext.matrix));
+    s_ext.matrix_dur = d;
+    return true;
+}
+static void x_set_opacity(void *ctx, double a, double d, int e) { (void)ctx; (void)d; (void)e; s_ext.opacity = a; }
+static void x_set_cursor(void *ctx, int c) { (void)ctx; s_ext.cursor = c; }
+static void x_set_draggable(void *ctx, bool v) { (void)ctx; s_ext.draggable = v; }
+static void x_set_clickthrough(void *ctx, bool v) { (void)ctx; s_ext.clickthrough = v; }
+static void x_subs_changed(void *ctx, unsigned m) { (void)ctx; s_ext.subs = m; s_ext.subs_calls++; }
+static double x_now(void *ctx) { (void)ctx; return s_ext.now; }
+
+static const ScriptHostExtOps EXT = {x_load_clip, x_unload_clip, x_clip_info, x_play, x_seek, x_get_frame,
+                                     x_set_speed, x_set_playing, x_set_matrix, x_set_opacity, x_set_cursor,
+                                     x_set_draggable, x_set_clickthrough, x_subs_changed, x_now};
+
+static Script *load_ext(FakeWin *w, const char *src, wchar_t *err)
+{
+    return script_create_ex(&OPS, &EXT, w, src, strlen(src), "test.lua", "test.gif", w->id, err, 512);
+}
+
+static ScriptInput input_at(int button, int x, int y)
+{
+    ScriptInput in;
+    memset(&in, 0, sizeof(in));
+    in.button = button;
+    in.x = x;
+    in.y = y;
+    in.gx = x - 100;
+    in.gy = y - 100;
+    in.opaque = true;
+    return in;
+}
+
+static bool run_check(Script *s, const char *fn)
+{
+    wchar_t err[512];
+    bool ok = script_event(s, fn, err, 512);
+    if (!ok) printf("     %s: %ls\n", fn, err);
+    return ok;
+}
+
+static void test_events(void)
+{
+    wchar_t err[512];
+    FakeWin w = {100, 100, 50, 50, false, 0, 0};
+    memset(&s_ext, 0, sizeof(s_ext));
+    bool handled;
+
+    /* Subscription mask: yagp.on handlers plus legacy globals, reported to the host. */
+    Script *s = load_ext(&w,
+        "h = yagp.on('click', function() end)\n"
+        "function on_moved() end\n"
+        "function drop() yagp.off(h) yagp.off(h) yagp.off(12345) on_moved = nil end\n", err);
+    CHECK(s, "subs load: %ls", err);
+    if (s) {
+        unsigned m = script_subscriptions(s);
+        CHECK(m == (SEV_BIT(SEV_CLICK) | SEV_BIT(SEV_MOVED)), "subs mask %x", m);
+        CHECK(s_ext.subs == m, "subs_changed: %x vs %x", s_ext.subs, m);
+        CHECK(run_check(s, "drop") && script_subscriptions(s) == 0 && s_ext.subs == 0,
+              "mask after off: %x", script_subscriptions(s));
+        script_destroy(s);
+    }
+
+    /* Routing: returning true or setting e.handled stops later handlers and is
+     * reported; a passthrough event runs them all and is never handled. The
+     * event table carries the input. */
+    s = load_ext(&w,
+        "order = ''\n"
+        "yagp.on('click', function(e) order = order .. 'a'\n"
+        "  assert(e.type == 'click' and e.button == 'left' and e.x == 120 and e.gx == 20 and e.opaque)\n"
+        "  if e.shift then e.handled = true end end)\n"
+        "yagp.on('click', function(e) order = order .. 'b' assert(not e.handled) return e.ctrl end)\n"
+        "yagp.on('click', function(e) order = order .. 'c' end)\n"
+        "function check() assert(order == 'abcaababc', order) end\n", err);
+    CHECK(s, "routing load: %ls", err);
+    if (s) {
+        ScriptInput in = input_at(SBTN_LEFT, 120, 130);
+        bool h[4];
+        script_input(s, SEV_CLICK, &in, &h[0], err, 512);
+        in.shift = true;
+        script_input(s, SEV_CLICK, &in, &h[1], err, 512);
+        in.shift = false;
+        in.ctrl = true;
+        script_input(s, SEV_CLICK, &in, &h[2], err, 512);
+        in.passthrough = true;
+        script_input(s, SEV_CLICK, &in, &h[3], err, 512);
+        CHECK(!h[0] && h[1] && h[2] && !h[3], "handled flags %d %d %d %d", h[0], h[1], h[2], h[3]);
+        CHECK(run_check(s, "check"), "routing order");
+        /* Not subscribed: nothing runs, not handled. */
+        CHECK(script_input(s, SEV_WHEEL, &in, &handled, err, 512) && !handled, "wheel: %ls", err);
+        script_destroy(s);
+    }
+
+    /* Subscribing and unsubscribing from inside a handler. */
+    s = load_ext(&w,
+        "n, m = 0, 0\n"
+        "local h\n"
+        "h = yagp.on('click', function() n = n + 1 yagp.off(h) yagp.on('click', function() m = m + 1 end) end)\n"
+        "function check() assert(n == 1 and m == 2, n .. ' ' .. m) end\n", err);
+    CHECK(s, "nested load: %ls", err);
+    if (s) {
+        ScriptInput in = input_at(SBTN_LEFT, 0, 0);
+        for (int i = 0; i < 3; ++i) CHECK(script_input(s, SEV_CLICK, &in, NULL, err, 512), "nested: %ls", err);
+        CHECK(run_check(s, "check"), "nested on/off");
+        script_destroy(s);
+    }
+
+    /* A handler error fails the call with the chunk name and line. */
+    s = load_ext(&w, "yagp.on('click', function()\n  error('boom')\nend)\n", err);
+    if (s) {
+        ScriptInput in = input_at(SBTN_LEFT, 0, 0);
+        CHECK(!script_input(s, SEV_CLICK, &in, NULL, err, 512) && wcsstr(err, L"test.lua:2:"),
+              "handler error: %ls", err);
+        script_destroy(s);
+    }
+
+    /* Event tables are reused: no allocation per input event. */
+    s = load_ext(&w,
+        "last = nil same = true\n"
+        "yagp.on('mouse_move', function(e) if last and last ~= e then same = false end last = e end)\n"
+        "function check() assert(same) end\n", err);
+    if (s) {
+        ScriptInput in = input_at(SBTN_NONE, 0, 0);
+        for (int i = 0; i < 100; ++i) script_input(s, SEV_MOUSE_MOVE, &in, NULL, err, 512);
+        CHECK(run_check(s, "check"), "event table reused");
+        script_destroy(s);
+    }
+
+    /* cursor: min_move, radius (near / far transitions from the hitbox centre)
+     * and rate filters, per handler. */
+    s_ext.now = 0;
+    s = load_ext(&w,
+        "all, moved, edges, slow = 0, 0, {}, 0\n"
+        "yagp.on('cursor', function(e) all = all + 1 assert(e.valid) end)\n"
+        "yagp.on('cursor', function() moved = moved + 1 end, {min_move = 50})\n"
+        "yagp.on('cursor', function(e) edges[#edges + 1] = e.near end, {radius = 100})\n"
+        "yagp.on('cursor', function() slow = slow + 1 end, {rate = 2})\n"
+        "function check() assert(all == 6, 'all ' .. all) assert(moved == 4, 'moved ' .. moved)\n"
+        "  assert(#edges == 2 and edges[1] == true and edges[2] == false, 'edges ' .. #edges)\n"
+        "  assert(slow == 2, 'slow ' .. slow) end\n", err);
+    CHECK(s, "cursor load: %ls", err);
+    if (s) {
+        CHECK(script_subscriptions(s) & SEV_BIT(SEV_CURSOR), "cursor bit");
+        /* Window 100,100 50x50: centre 125,125. */
+        static const int path[6][2] = {{1000, 1000}, {1010, 1000}, {1100, 1000}, {150, 150}, {160, 150}, {600, 600}};
+        for (int i = 0; i < 6; ++i) {
+            s_ext.now = i * 0.2;
+            CHECK(script_cursor(s, path[i][0], path[i][1], true, err, 512), "cursor %d: %ls", i, err);
+        }
+        CHECK(run_check(s, "check"), "cursor filters");
+        script_destroy(s);
+    }
+
+    /* Peer events: id and radius filters; legacy on_collide still runs. */
+    s = load_ext(&w,
+        "a, b, c, legacy = 0, 0, 0, 0\n"
+        "yagp.on('peer_moved', function(p) a = a + 1 end)\n"
+        "yagp.on('peer_moved', function(p) assert(p.id == 7) b = b + 1 end, {id = 7})\n"
+        "yagp.on('peer_moved', function(p) c = c + 1 end, {radius = 100})\n"
+        "function on_collide(p) legacy = legacy + 1 end\n"
+        "yagp.on('collide', function(p) legacy = legacy + 10 end)\n"
+        "function check() assert(a == 2 and b == 1 and c == 1 and legacy == 11, a .. b .. c .. legacy) end\n", err);
+    CHECK(s, "peer load: %ls", err);
+    if (s) {
+        ScriptPeer pnear = {.id = 7, .x = 150, .y = 100, .w = 20, .h = 20, .hx = 150, .hy = 100, .hw = 20, .hh = 20, .name = ""};
+        ScriptPeer pfar = {.id = 8, .x = 900, .y = 900, .w = 20, .h = 20, .hx = 900, .hy = 900, .hw = 20, .hh = 20, .name = ""};
+        CHECK(script_peer_event(s, SEV_PEER_MOVED, &pnear, err, 512), "peer 1: %ls", err);
+        CHECK(script_peer_event(s, SEV_PEER_MOVED, &pfar, err, 512), "peer 2: %ls", err);
+        CHECK(script_peer_event(s, SEV_COLLIDE, &pnear, err, 512), "collide: %ls", err);
+        CHECK(run_check(s, "check"), "peer filters");
+        script_destroy(s);
+    }
+
+    /* Frame and clip_end: filtered by clip name and frame set (1-based in Lua). */
+    s = load_ext(&w,
+        "hits, ends = {}, {}\n"
+        "yagp.on('frame', function(f, clip) hits[#hits + 1] = clip .. f end, {frames = {2, 3}, clip = 'walk'})\n"
+        "yagp.on('clip_end', function(clip) ends[#ends + 1] = clip end)\n"
+        "function check() assert(table.concat(hits, ',') == 'walk2,walk3', table.concat(hits, ','))\n"
+        "  assert(#ends == 1 and ends[1] == 'sit') end\n", err);
+    CHECK(s, "frame load: %ls", err);
+    if (s) {
+        for (int f = 0; f < 4; ++f) script_clip_event(s, SEV_FRAME, "walk", f, err, 512);
+        script_clip_event(s, SEV_FRAME, "sit", 1, err, 512);
+        script_clip_event(s, SEV_CLIP_END, "sit", 0, err, 512);
+        CHECK(run_check(s, "check"), "frame filters");
+        script_destroy(s);
+    }
+
+    /* Timers: due order, a 0-delay timer added by a callback waits for the
+     * next run, repeating timers never burst, cancel. */
+    s_ext.now = 10;
+    s = load_ext(&w,
+        "log = ''\n"
+        "yagp.after(0.5, function() log = log .. 'b' end)\n"
+        "yagp.after(0.2, function() log = log .. 'a' end)\n"
+        "rep = yagp.every(1, function() log = log .. 'r' end)\n"
+        "local x = yagp.after(0.3, function() log = log .. 'X' end) yagp.cancel(x)\n"
+        "yagp.after(0.1, function() yagp.after(0, function() log = log .. 'z' end) end)\n"
+        "function check1() assert(log == 'ab', log) end\n"
+        "function check2() assert(log == 'abzrr', log) yagp.cancel(rep) end\n", err);
+    CHECK(s, "timers load: %ls", err);
+    if (s) {
+        CHECK(fabs(script_next_timer(s) - 10.1) < 1e-9, "next timer %g", script_next_timer(s));
+        s_ext.now = 10.6;
+        CHECK(script_run_timers(s, 10.6, err, 512), "timers: %ls", err);
+        CHECK(run_check(s, "check1"), "timer order");
+        CHECK(script_run_timers(s, 10.6, err, 512), "timers 2: %ls", err);
+        CHECK(script_run_timers(s, 15.0, err, 512), "timers 3: %ls", err);
+        CHECK(script_run_timers(s, 15.5, err, 512), "timers 4: %ls", err);
+        CHECK(script_run_timers(s, 16.0, err, 512), "timers 5: %ls", err);
+        CHECK(run_check(s, "check2"), "timer repeat");
+        CHECK(script_next_timer(s) < 0, "timers left: %g", script_next_timer(s));
+        script_destroy(s);
+    }
+    /* A timer callback error is reported. */
+    s_ext.now = 0;
+    s = load_ext(&w, "yagp.after(0, function() error('tick') end)", err);
+    if (s) {
+        CHECK(!script_run_timers(s, 1, err, 512) && wcsstr(err, L"tick"), "timer error: %ls", err);
+        script_destroy(s);
+    }
+
+    /* Clip / playback / composition / input wrappers reach the host. */
+    memset(&s_ext, 0, sizeof(s_ext));
+    s = load_ext(&w,
+        "assert(yagp.clip('walk', 'walk.gif') == true)\n"
+        "local ok, e = yagp.clip('gone', 'missing.gif') assert(ok == nil and e:find('missing'))\n"
+        "local i = yagp.clip_info('walk') assert(i.w == 40 and i.frames == 3 and i.ready and i.delays[2] == 0.2)\n"
+        "assert(yagp.clip_info('nope') == nil)\n"
+        "assert(yagp.play('walk', {from = 2, to = 3, loop = 2, speed = 2, anchor = 'center', sync = true}))\n"
+        "local ok2, e2 = yagp.play('nope') assert(not ok2 and e2:find('nope'))\n"
+        "assert(yagp.seek(2) and not yagp.seek(9))\n"
+        "local name, f, n = yagp.frame() assert(name == 'walk' and f == 2 and n == 3)\n"
+        "yagp.set_transform{sx = 2, sy = 0.5}\n"
+        "yagp.set_opacity(0.5, 0.2) yagp.set_cursor('hand') yagp.set_draggable(false) yagp.set_clickthrough(true)\n", err);
+    CHECK(s, "ext api: %ls", err);
+    if (s) {
+        CHECK(strcmp(s_ext.playing, "walk") == 0 && s_ext.last_play.from == 1 && s_ext.last_play.to == 2 &&
+              s_ext.last_play.loops == 2 && s_ext.last_play.speed == 2 && s_ext.last_play.anchor == SANCHOR_CENTER &&
+              s_ext.last_play.sync && s_ext.last_play.restart, "play options");
+        CHECK(s_ext.seek_to == 8, "seek %d", s_ext.seek_to);
+        /* Scale about the bottom centre of a 50x50 window: x' = 2x - 25, y' = 0.5y + 25. */
+        const double *m = s_ext.matrix;
+        CHECK(fabs(m[0] - 2) < 1e-9 && fabs(m[3] - 0.5) < 1e-9 && fabs(m[1]) < 1e-9 && fabs(m[2]) < 1e-9 &&
+              fabs(m[4] + 25) < 1e-9 && fabs(m[5] - 25) < 1e-9,
+              "matrix %g %g %g %g %g %g", m[0], m[1], m[2], m[3], m[4], m[5]);
+        CHECK(s_ext.opacity == 0.5 && s_ext.cursor == SCURSOR_HAND && !s_ext.draggable && s_ext.clickthrough,
+              "input behaviour");
+        script_destroy(s);
+    }
+    /* Without ext ops the functions exist and fail softly. */
+    s = load(&w, "assert(yagp.clip('a', 'a.gif') == nil and yagp.play('main') == nil)\n"
+                 "assert(yagp.frame() == 'main') yagp.set_opacity(1) yagp.set_cursor('arrow')\n", err);
+    CHECK(s, "no ext: %ls", err);
+    script_destroy(s);
+
+    /* Bad arguments fail at the call. */
+    static const char *const bad[] = {
+        "yagp.on('clik', function() end)",
+        "yagp.on('click', 42)",
+        "yagp.on('cursor', function() end, {radius = -1})",
+        "yagp.on('frame', function() end, {frames = {0}})",
+        "for i = 1, 65 do yagp.on('click', function() end) end",
+        "for i = 1, 65 do yagp.after(1, function() end) end",
+        "yagp.play('main', {from = 3, to = 2})",
+        "yagp.play('main', {loop = 0})",
+        "yagp.play('main', {anchor = 'side'})",
+        "yagp.set_matrix(1, 0, 0, 0, 0, 0)",
+        "yagp.set_matrix(100, 0, 0, 1, 0, 0)",
+        "yagp.set_transform{sx = 0}",
+        "yagp.set_opacity(2)",
+        "yagp.set_cursor('wait')",
+        "yagp.clip('main', 'a.gif')",
+        "yagp.clip(string.rep('x', 40), 'a.gif')",
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); ++i) {
+        s = load_ext(&w, bad[i], err);
+        CHECK(!s, "accepted: %s", bad[i]);
+        script_destroy(s);
+    }
+}
+
+static void test_clip_path(void)
+{
+    const wchar_t *base = L"C:\\pets\\cat\\main.gif";
+    wchar_t out[512];
+    CHECK(clip_resolve_path(base, "sit.gif", out, 512) && wcscmp(out, L"C:\\pets\\cat\\sit.gif") == 0, "plain: %ls", out);
+    CHECK(clip_resolve_path(base, "dir/Look_3.GIF", out, 512) && wcscmp(out, L"C:\\pets\\cat\\dir\\Look_3.GIF") == 0,
+          "subdir: %ls", out);
+    CHECK(clip_resolve_path(base, "\xE5\x9D\x90.gif", out, 512), "utf-8 name");
+    static const char *const bad[] = {
+        "", "../x.gif", "a/../../x.gif", "..\\x.gif", "./x.gif", "C:\\x.gif", "C:x.gif", "/x.gif",
+        "\\\\server\\share\\x.gif", "x.gif:stream", "x.gif.", "x.gif ", "a//x.gif", "a/", "x.png", "x",
+        "con.gif", "sub/NUL.gif", "com1.gif", "a*.gif", "a?.gif", "\x01.gif", "\xFF.gif", ".gif",
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); ++i) {
+        CHECK(!clip_resolve_path(base, bad[i], out, 512), "accepted path '%s' -> %ls", bad[i], out);
+    }
+    CHECK(!clip_resolve_path(L"nofolder.gif", "x.gif", out, 512), "base without folder");
+    CHECK(!clip_resolve_path(base, "x.gif", out, 10), "tiny buffer");
+}
+
+/* ---- input state machine ---------------------------------------------------- */
+
+static const InputMetrics FSM_M = {4, 4, 4, 4, 500, 400};
+
+static bool out_is(const InputOut *o, int n, int e0, int e1, int e2)
+{
+    int want[3] = {e0, e1, e2};
+    if (o->n != n) return false;
+    for (int i = 0; i < n && i < 3; ++i) {
+        if (o->ev[i] != want[i]) return false;
+    }
+    return true;
+}
+
+static void test_input_fsm(void)
+{
+    InputFsm f;
+    InputOut o;
+    ifsm_reset(&f);
+
+    ifsm_move(&f, &FSM_M, 10, 10, true, 0, &o);
+    CHECK(out_is(&o, 2, IFSM_ENTER, IFSM_MOVE, 0), "enter+move: n=%d", o.n);
+    ifsm_idle(&f, &FSM_M, 300, &o);
+    CHECK(o.n == 0, "hover too early");
+    ifsm_idle(&f, &FSM_M, 400, &o);
+    CHECK(out_is(&o, 1, IFSM_HOVER, 0, 0), "hover");
+    ifsm_idle(&f, &FSM_M, 900, &o);
+    CHECK(o.n == 0, "hover twice");
+
+    /* Click, then a second one in time and place: double click. */
+    ifsm_button_down(&f, &FSM_M, 1, 10, 10, 1000, &o);
+    CHECK(out_is(&o, 1, IFSM_DOWN, 0, 0) && o.button == 1, "down");
+    ifsm_move(&f, &FSM_M, 11, 10, true, 1010, &o); /* Inside the drag threshold. */
+    CHECK(out_is(&o, 1, IFSM_MOVE, 0, 0), "small move while down");
+    ifsm_button_up(&f, &FSM_M, 1, 11, 10, 1050, &o);
+    CHECK(out_is(&o, 2, IFSM_UP, IFSM_CLICK, 0), "click");
+    CHECK(ifsm_default_action(&f, &o, 1, false) == IFSM_ACT_NONE, "left click has no default");
+    ifsm_button_down(&f, &FSM_M, 1, 11, 11, 1200, &o);
+    ifsm_button_up(&f, &FSM_M, 1, 11, 11, 1250, &o);
+    CHECK(out_is(&o, 3, IFSM_UP, IFSM_CLICK, IFSM_DOUBLE_CLICK), "double click n=%d", o.n);
+    /* A third click starts over. */
+    ifsm_button_down(&f, &FSM_M, 1, 11, 11, 1300, &o);
+    ifsm_button_up(&f, &FSM_M, 1, 11, 11, 1350, &o);
+    CHECK(out_is(&o, 2, IFSM_UP, IFSM_CLICK, 0), "third click");
+    /* Too slow: no double. */
+    ifsm_button_down(&f, &FSM_M, 1, 11, 11, 2400, &o);
+    ifsm_button_up(&f, &FSM_M, 1, 11, 11, 2450, &o);
+    CHECK(out_is(&o, 2, IFSM_UP, IFSM_CLICK, 0), "slow second click");
+
+    /* Left drag: unhandled -> system drag; no click afterwards. */
+    ifsm_button_down(&f, &FSM_M, 1, 10, 10, 5000, &o);
+    ifsm_move(&f, &FSM_M, 20, 10, true, 5010, &o);
+    CHECK(out_is(&o, 1, IFSM_DRAG_START, 0, 0) && o.dx == 10, "drag_start");
+    CHECK(ifsm_default_action(&f, &o, 0, false) == IFSM_ACT_SYSTEM_DRAG, "system drag");
+    CHECK(ifsm_default_action(&f, &o, 0, true) == IFSM_ACT_NONE, "handled drag");
+    ifsm_cancel(&f); /* The system move loop took over the press. */
+    ifsm_button_up(&f, &FSM_M, 1, 20, 10, 5100, &o);
+    CHECK(o.n == 0, "up after system drag");
+
+    /* Script-owned drag: drag with deltas, drag_end, no click. */
+    ifsm_button_down(&f, &FSM_M, 1, 10, 10, 6000, &o);
+    ifsm_move(&f, &FSM_M, 30, 10, true, 6010, &o);
+    ifsm_take_drag(&f);
+    ifsm_move(&f, &FSM_M, 33, 12, false, 6020, &o); /* Captured: outside is fine. */
+    CHECK(out_is(&o, 1, IFSM_DRAG, 0, 0) && o.dx == 3 && o.dy == 2, "drag delta %d %d", o.dx, o.dy);
+    ifsm_button_up(&f, &FSM_M, 1, 33, 12, 6100, &o);
+    CHECK(out_is(&o, 2, IFSM_UP, IFSM_DRAG_END, 0), "drag_end");
+    /* The cursor ended outside: the next move leaves. */
+    ifsm_move(&f, &FSM_M, 300, 300, false, 6200, &o);
+    CHECK(out_is(&o, 1, IFSM_LEAVE, 0, 0), "leave after drag");
+
+    /* Right click: menu unless handled; a right drag has no default. */
+    ifsm_button_down(&f, &FSM_M, 2, 10, 10, 7000, &o);
+    CHECK(out_is(&o, 2, IFSM_ENTER, IFSM_DOWN, 0), "enter on press");
+    ifsm_button_up(&f, &FSM_M, 2, 10, 10, 7050, &o);
+    CHECK(ifsm_default_action(&f, &o, 1, false) == IFSM_ACT_MENU, "menu");
+    CHECK(ifsm_default_action(&f, &o, 1, true) == IFSM_ACT_NONE, "menu handled");
+    ifsm_button_down(&f, &FSM_M, 2, 10, 10, 8000, &o);
+    ifsm_move(&f, &FSM_M, 40, 10, true, 8010, &o);
+    CHECK(ifsm_default_action(&f, &o, 0, false) == IFSM_ACT_NONE, "right drag default");
+    /* A second button during a press is ignored. */
+    ifsm_button_down(&f, &FSM_M, 1, 40, 10, 8020, &o);
+    CHECK(o.n == 0, "second button");
+    ifsm_button_up(&f, &FSM_M, 1, 40, 10, 8030, &o);
+    CHECK(o.n == 0, "other button up");
+    ifsm_button_up(&f, &FSM_M, 2, 40, 10, 8040, &o);
+    CHECK(out_is(&o, 1, IFSM_UP, 0, 0), "right drag ends without click");
+    ifsm_leave(&f, &o);
+    CHECK(out_is(&o, 1, IFSM_LEAVE, 0, 0), "explicit leave");
+    ifsm_leave(&f, &o);
+    CHECK(o.n == 0, "leave twice");
+}
+
+static void test_transform(void)
+{
+    Xform x = {{2, 0, 0, 0.5, -25, 25}}, inv;
+    double px, py;
+    xform_apply(&x, 25, 50, &px, &py);
+    CHECK(fabs(px - 25) < 1e-9 && fabs(py - 50) < 1e-9, "pivot fixed: %g %g", px, py);
+    CHECK(xform_invert(&x, &inv), "invert");
+    xform_apply(&inv, px, py, &px, &py);
+    CHECK(fabs(px - 25) < 1e-9 && fabs(py - 50) < 1e-9, "inverse: %g %g", px, py);
+    int bb[4];
+    xform_aabb(&x, 50, 50, bb);
+    CHECK(bb[0] == -25 && bb[1] == 25 && bb[2] == 75 && bb[3] == 50, "aabb %d %d %d %d", bb[0], bb[1], bb[2], bb[3]);
+    Xform rot = {{0, 1, -1, 0, 0, 0}}; /* 90 degrees */
+    xform_aabb(&rot, 40, 20, bb);
+    CHECK(bb[0] == -20 && bb[1] == 0 && bb[2] == 0 && bb[3] == 40, "rot aabb %d %d %d %d", bb[0], bb[1], bb[2], bb[3]);
+    Xform flat = {{1, 0, 0, 0, 0, 0}};
+    CHECK(!xform_invert(&flat, &inv), "degenerate invertible");
+    for (int e = 0; e < 4; ++e) {
+        CHECK(fabs(xform_ease(e, 0)) < 1e-12 && fabs(xform_ease(e, 1) - 1) < 1e-12, "ease %d ends", e);
+        double prev = 0;
+        for (int i = 1; i <= 100; ++i) {
+            double v = xform_ease(e, i / 100.0);
+            CHECK(v >= prev - 1e-12, "ease %d not monotonic", e);
+            prev = v;
+        }
+    }
+    XformAnim a;
+    xform_anim_start(&a, &XFORM_IDENTITY, &x, 1.0, 2.0, SEASE_LINEAR);
+    Xform mid;
+    xform_anim_eval(&a, 2.0, &mid);
+    CHECK(fabs(mid.m[0] - 1.5) < 1e-9 && fabs(mid.m[4] + 12.5) < 1e-9, "anim mid %g %g", mid.m[0], mid.m[4]);
+    CHECK(!xform_anim_done(&a, 2.9) && xform_anim_done(&a, 3.0), "anim done");
+    /* Rebasing mid-way continues along the same curve, for every easing. */
+    for (int e = 0; e < 4; ++e) {
+        XformAnim ref, rb;
+        xform_anim_start(&ref, &XFORM_IDENTITY, &x, 1.0, 2.0, e);
+        rb = ref;
+        xform_anim_rebase(&rb, 1.6);
+        double worst = 0;
+        for (int i = 0; i <= 20; ++i) {
+            double t = 1.6 + 1.4 * i / 20.0;
+            Xform p1, p2;
+            xform_anim_eval(&ref, t, &p1);
+            xform_anim_eval(&rb, t, &p2);
+            for (int k = 0; k < 6; ++k) worst = fmax(worst, fabs(p1.m[k] - p2.m[k]));
+        }
+        CHECK(worst < 1e-9 && fabs(rb.t0 + rb.duration - 3.0) < 1e-12, "rebase easing %d off by %g", e, worst);
+        xform_anim_rebase(&rb, 2.3);
+        Xform p1, p2;
+        xform_anim_eval(&ref, 2.7, &p1);
+        xform_anim_eval(&rb, 2.7, &p2);
+        CHECK(fabs(p1.m[0] - p2.m[0]) < 1e-9, "double rebase easing %d", e);
+    }
+}
+
 int main(void)
 {
     /* 1920x1080 primary (40 px taskbar) and a 1280x1024 monitor to its right,
@@ -1011,6 +1546,10 @@ int main(void)
     test_hitbox_api();
     test_hitbox_presets();
     test_robustness();
+    test_events();
+    test_clip_path();
+    test_input_fsm();
+    test_transform();
     if (s_failures) {
         printf("%d check(s) failed\n", s_failures);
         return 1;

@@ -11,10 +11,21 @@
  *  before frame i and after it. dirty[0] is the loop wrap (last -> first).
  * Stored in <dir>\<hash>.ygc and reused while the GIF file and colour key
  * are unchanged. */
+/* Per-frame index, for seeking. offset is GifStream.frame_offset; a keyframe
+ * is a frame whose canvas does not depend on any earlier frame, so decoding
+ * can start there (gif_stream_seek). Frame 0 always is one. */
+#define FRAME_KEYFRAME 1u
+typedef struct FrameInfo {
+    uint32_t offset;
+    uint32_t delay_ms;      /* As played (0/1 cs already mapped to 100 ms). */
+    uint32_t flags;         /* FRAME_* */
+} FrameInfo;
+
 typedef struct FrameCache {
     int width, height;
     int frame_count;
     uint16_t (*dirty)[4];   /* left, top, right, bottom; left >= right = unchanged. */
+    FrameInfo *frames;      /* frame_count entries. */
     /* Bounding box of every pixel that is not transparent in any frame (after
      * the colour key): the GIF's visible area, used as its hitbox. GIF pixels;
      * left >= right = fully transparent. */

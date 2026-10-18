@@ -1,8 +1,0 @@
-#ifndef YAGP_POSIX_SHELLSCALINGAPI_H
-#define YAGP_POSIX_SHELLSCALINGAPI_H
-#include <windows.h>
-
-typedef enum MONITOR_DPI_TYPE { MDT_EFFECTIVE_DPI = 0 } MONITOR_DPI_TYPE;
-HRESULT GetDpiForMonitor(HMONITOR m, MONITOR_DPI_TYPE type, UINT *x, UINT *y);
-
-#endif

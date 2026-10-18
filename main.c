@@ -1,5 +1,6 @@
 #include "app.h"
 #include "config.h"
+#include "cursor_hook.h"
 #include "frame_cache.h"
 #include "i18n.h"
 #include "monitors.h"
@@ -53,8 +54,8 @@ void app_reschedule(void)
 {
     int64_t earliest = INT64_MAX;
     for (Overlay *o = g_app.overlays; o; o = o->next) {
-        if (overlay_is_animating(o) && o->next_frame < earliest) earliest = o->next_frame;
-        if (overlay_is_moving(o) && o->next_tick < earliest) earliest = o->next_tick;
+        int64_t t = overlay_deadline(o);
+        if (t < earliest) earliest = t;
     }
     if (earliest == INT64_MAX) {
         /* Nothing animating: the thread blocks until a message arrives. */
@@ -96,15 +97,11 @@ static void app_tick(void)
     int64_t slack = g_app.qpc_freq / 1000;
     bool moved = false;
     for (Overlay *o = g_app.overlays; o; o = o->next) {
-        if (overlay_is_animating(o) && o->next_frame - now <= slack) overlay_advance(o, now);
-        if (overlay_is_moving(o) && o->next_tick - now <= slack) {
-            overlay_step(o, now);
-            moved = true;
-        }
+        if (overlay_service(o, now, slack)) moved = true;
         if (o->dragging) moved = true;
     }
     /* Only when something moved, so an idle tray still does no work. */
-    if (moved) overlay_update_contacts();
+    if (moved || overlay_peers_dirty()) overlay_update_contacts();
     if (render_device_lost(g_app.device)) recover_device();
     app_reschedule();
 }
@@ -168,6 +165,10 @@ static void add_overlay_from_path(const wchar_t *path, void *ctx)
         return;
     }
     link_overlay(o);
+    overlay_announce(o, true);
+    /* Its script was started before it was linked, so the mouse hook could
+     * not see its subscriptions yet. */
+    overlay_refresh_hook();
     app_changed();
 }
 
@@ -188,10 +189,13 @@ void app_remove_overlay(Overlay *o)
     for (Overlay **p = &g_app.overlays; *p; p = &(*p)->next) {
         if (*p == o) {
             *p = o->next;
+            o->next = NULL;
+            if (!o->hidden) overlay_announce(o, false);
             overlay_destroy(o);
             break;
         }
     }
+    overlay_refresh_hook();
     app_changed();
 }
 
@@ -783,6 +787,13 @@ static LRESULT CALLBACK tray_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     case WM_APP_CACHE_READY:
         overlay_cache_ready((void *)lp);
+        app_reschedule();
+        return 0;
+    case WM_APP_CURSOR:
+        overlay_cursor_moved();
+        return 0;
+    case WM_APP_HOOK_INPUT:
+        overlay_hook_input();
         return 0;
     case WM_DISPLAYCHANGE:
     case WM_DPICHANGED:
@@ -876,6 +887,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmdline, int show)
     g_app.tray_icon = make_tray_icon();
     tray_add_icon();
     config_load(restore_overlay, NULL);
+    overlay_refresh_hook(); /* Restored scripts' cursor / input subscriptions. */
     for (int i = 1; argv && i < argc; ++i) {
         wchar_t full[MAX_PATH * 4];
         DWORD len = GetFullPathNameW(argv[i], ARRAYSIZE(full), full, NULL);
@@ -902,6 +914,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmdline, int show)
     }
 
 shutdown:
+    cursor_hook_shutdown();
     if (g_app.pick_process) TerminateProcess(g_app.pick_process, 0);
     pick_close();
     save_now();

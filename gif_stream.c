@@ -334,6 +334,10 @@ static int read_image(GifStream *g)
     int w = d->Image.Width, h = d->Image.Height;
     if (x < 0 || y < 0 || w <= 0 || h <= 0 ||
         x > g->width - w || y > g->height - h) return -1;
+    g->frame_rect[0] = x;
+    g->frame_rect[1] = y;
+    g->frame_rect[2] = x + w;
+    g->frame_rect[3] = y + h;
     const ColorMapObject *palette = d->Image.ColorMap ? d->Image.ColorMap : d->SColorMap;
     if (!palette || !palette->Colors) return -1;
     build_key_mask(g, palette);
@@ -390,14 +394,87 @@ static int read_image(GifStream *g)
     return 1;
 }
 
+int gif_stream_seek(GifStream *g, size_t offset)
+{
+    if (!g->decoder && start_decoder(g) < 0) return -1;
+    /* giflib reads straight from gif_input with no read-ahead, and every frame
+     * is consumed up to its block terminator, so between frames its only
+     * state is our read position. */
+    if (offset < 13 || offset >= g->size) return -1;
+    g->pos = offset;
+    memset(g->bgra, 0, (size_t)g->out_w * (size_t)g->out_h * 4);
+    g->pending_delay_cs = 0;
+    g->pending_disposal = 0;
+    g->pending_transparent = -1;
+    g->old_disposal = 0;
+    g->canvas_fresh = 1;
+    return 0;
+}
+
+int gif_stream_snapshot_save(const GifStream *g, GifSnapshot *s)
+{
+    size_t bytes = (size_t)g->out_w * (size_t)g->out_h * 4;
+    memset(s, 0, sizeof(*s));
+    s->bgra = (uint8_t *)malloc(bytes);
+    if (!s->bgra) return -1;
+    memcpy(s->bgra, g->bgra, bytes);
+    if (g->old_disposal == 3 && g->backup) {
+        s->backup = (uint8_t *)malloc(bytes);
+        if (!s->backup) {
+            gif_stream_snapshot_free(s);
+            return -1;
+        }
+        memcpy(s->backup, g->backup, bytes);
+    }
+    s->pos = g->pos;
+    s->out_w = g->out_w;
+    s->out_h = g->out_h;
+    s->old_disposal = s->backup || g->old_disposal != 3 ? g->old_disposal : 0;
+    memcpy(s->old_box, g->old_box, sizeof(s->old_box));
+    return 0;
+}
+
+int gif_stream_snapshot_restore(GifStream *g, const GifSnapshot *s)
+{
+    if (!s->bgra || s->out_w != g->out_w || s->out_h != g->out_h) return -1;
+    if (!g->decoder && start_decoder(g) < 0) return -1;
+    size_t bytes = (size_t)g->out_w * (size_t)g->out_h * 4;
+    if (s->backup) {
+        if (!g->backup && !(g->backup = (uint8_t *)malloc(bytes))) return -1;
+        memcpy(g->backup, s->backup, bytes);
+    }
+    memcpy(g->bgra, s->bgra, bytes);
+    g->pos = s->pos;
+    g->pending_delay_cs = 0;
+    g->pending_disposal = 0;
+    g->pending_transparent = -1;
+    g->old_disposal = s->old_disposal;
+    memcpy(g->old_box, s->old_box, sizeof(g->old_box));
+    g->canvas_fresh = 1; /* The whole canvas may differ from what was shown. */
+    return 0;
+}
+
+void gif_stream_snapshot_free(GifSnapshot *s)
+{
+    free(s->bgra);
+    free(s->backup);
+    memset(s, 0, sizeof(*s));
+}
+
 int gif_stream_next(GifStream *g)
 {
     GifRecordType type;
     if (!g->decoder) return -1;
+    size_t start = g->pos; /* The frame's first record (usually its graphics control extension). */
     for (;;) {
         if (DGifGetRecordType(g->decoder, &type) == GIF_ERROR) return -1;
         if (type == TERMINATE_RECORD_TYPE) return 0;
-        if (type == IMAGE_DESC_RECORD_TYPE) return read_image(g);
+        if (type == IMAGE_DESC_RECORD_TYPE) {
+            g->frame_offset = start;
+            g->frame_disposal = g->pending_disposal;
+            g->frame_transparent = g->pending_transparent >= 0;
+            return read_image(g);
+        }
         if (type == EXTENSION_RECORD_TYPE) {
             int extension_code = 0;
             GifByteType *block = NULL;

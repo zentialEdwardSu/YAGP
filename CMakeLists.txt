@@ -73,8 +73,8 @@ target_compile_definitions(lua PRIVATE _CRT_SECURE_NO_WARNINGS)
 target_compile_options(lua PRIVATE /W0)
 
 add_executable(yagp WIN32
-    main.c overlay.c config.c dialogs.c gif_stream.c frame_cache.c dx11_renderer.cpp
-    monitors.c script.c contacts.c presets.rc app.manifest)
+    main.c overlay.c clip.c clip_path.c config.c cursor_hook.c dialogs.c gif_stream.c frame_cache.c
+    dx11_renderer.cpp input_fsm.c monitors.c script.c contacts.c transform.c presets.rc app.manifest)
 # UI language for i18n.h: zh_CN (default) or en.
 set(YAGP_LANG "zh_CN" CACHE STRING "UI language (zh_CN, en)")
 set_property(CACHE YAGP_LANG PROPERTY STRINGS zh_CN en)
@@ -103,7 +103,8 @@ target_compile_definitions(gif_dump PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARN
 target_link_libraries(gif_dump PRIVATE giflib user32 shell32 ole32)
 
 # Lua host + preset regression test: build/script_test.exe
-add_executable(script_test EXCLUDE_FROM_ALL tests/script_test.c script.c monitors.c contacts.c)
+add_executable(script_test EXCLUDE_FROM_ALL tests/script_test.c script.c monitors.c contacts.c clip_path.c
+    input_fsm.c transform.c)
 target_include_directories(script_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_definitions(script_test PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS
     YAGP_SCRIPT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/scripts" ${YAGP_LANG_DEFINE})

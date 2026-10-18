@@ -1,6 +1,7 @@
 -- 躲避鼠标：鼠标靠近到 RADIUS 以内时 GIF 逃开，越近逃得越快；鼠标离开后慢慢回到原位。
 -- 被逼到工作区边缘时沿边缘滑开，逃不动（被困在角落）时跳到工作区另一侧。
--- 坐标均为物理像素。
+-- 鼠标不在附近、GIF 也已回到原位时不运行任何代码：只订阅"鼠标进入 RADIUS 范围"事件，
+-- 进入后才开始逐帧更新。坐标均为物理像素。
 
 RADIUS = 220      -- 开始躲避的距离（GIF 中心到鼠标）
 SPEED = 700       -- 最大逃跑速度（像素/秒）
@@ -43,7 +44,7 @@ local function escape(work, mx, my)
   face(x + dx + hw / 2 - mx)
 end
 
-function update(dt)
+local function step(dt)
   local mx, my, valid = yagp.cursor()
   if not valid then return end
   local work = yagp.monitor().work
@@ -70,12 +71,12 @@ function update(dt)
   end
 
   stuck = 0
-  if not RETURN then return end
+  if not RETURN then update = nil return end -- 安全了：停止逐帧更新，等鼠标再靠近
   calm = calm + dt
   if calm < RETURN_DELAY then return end
   local hx, hy = home_x - x, home_y - y
   local hd = math.sqrt(hx * hx + hy * hy)
-  if hd < 0.5 then return end
+  if hd < 0.5 then update = nil return end -- 已回到原位
   -- 回家的路上不要撞进鼠标的躲避范围：等鼠标离开再走。
   local step = math.min(hd, RETURN_SPEED * dt)
   local nx, ny = x + hx / hd * step, y + hy / hd * step
@@ -86,8 +87,13 @@ function update(dt)
   face(hx)
 end
 
+-- 鼠标进入 RADIUS 范围（距离由宿主按可见区域中心计算）时恢复逐帧更新。
+local function wake() update = step end
+yagp.on("cursor", function(e) if e.near then wake() end end, {radius = RADIUS})
+
 -- 用户拖动后，新位置就是新的“家”。
-on_moved = reset
-on_screens_changed = reset
+on_moved = function() reset() wake() end
+on_screens_changed = on_moved
 
 reset()
+update = step
