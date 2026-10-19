@@ -123,6 +123,10 @@ typedef struct ScriptHostExtOps {
     void (*subs_changed)(void *ctx, unsigned mask);
     /* Monotonic seconds for timers; NULL = QueryPerformanceCounter. */
     double (*now)(void *ctx);
+    /* Shows a tray notification. title/text are UTF-8 and already bounded by
+     * the script host. Returns false when the host cannot show one. NULL =
+     * notifications are unavailable (e.g. script_create without ext). */
+    bool (*notify)(void *ctx, const char *title, const char *text);
 } ScriptHostExtOps;
 
 typedef struct Script Script;

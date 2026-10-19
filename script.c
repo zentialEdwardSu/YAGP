@@ -1,6 +1,7 @@
 #include "script.h"
 #include "contacts.h"
 #include "i18n.h"
+#include "log.h"
 #include "monitors.h"
 
 #include <math.h>
@@ -18,6 +19,12 @@
 #define SCRIPT_HOOK_BUDGET 10000       /* Hook calls per entry: ~10M instructions. */
 #define SCRIPT_MAX_TIMERS 64
 #define SCRIPT_MAX_HANDLERS 64         /* yagp.on subscriptions alive at once. */
+/* yagp.log / print throttling, per script. */
+#define SCRIPT_LOG_MAX 1024            /* Bytes kept from one log call. */
+#define SCRIPT_LOG_PER_SEC 100         /* Lines accepted per 1 s window. */
+#define SCRIPT_LOG_WINDOW 1.0
+/* yagp.notify throttling. */
+#define SCRIPT_NOTIFY_WINDOW 3.0
 
 /* yagp.after / yagp.every. The function lives in the registry (ref). */
 typedef struct Timer {
@@ -49,6 +56,14 @@ struct Script {
     int dead_handlers;             /* Removed entries still in the lists. */
     Timer timers[SCRIPT_MAX_TIMERS];
     int timer_count;
+    /* yagp.log / print: fixed window plus a summary of what was dropped. */
+    double log_window;
+    int log_count;
+    int log_dropped;
+    /* yagp.notify: one balloon per window. */
+    double notify_next;
+    double notify_window;
+    int notify_dropped;
 };
 
 /* Registry keys (addresses are unique and never collected). */
@@ -511,26 +526,167 @@ static int l_set_rate(lua_State *L)
     return 0;
 }
 
-/* print -> OutputDebugString ("[YAGP name] ..."), visible in DebugView. */
+/* ---- yagp.log, print and rate limiting ------------------------------------
+ * Messages are built into fixed buffers: no Lua allocation and no metamethods,
+ * so a log call can never raise. Each script may write 100 lines per second;
+ * the excess is dropped and summarised by the host timer service. */
+
+static double script_now(Script *s);
+
+static void script_tag(const Script *s, char *out, size_t cap)
+{
+    _snprintf_s(out, cap, _TRUNCATE, "script %s#%d", s->name, s->id);
+}
+
+static void append_text(char *out, size_t cap, size_t *used, const char *text, size_t len, bool *truncated)
+{
+    size_t room = *used < cap ? cap - 1 - *used : 0;
+    if (len > room) {
+        memcpy(out + *used, text, room);
+        *used += room;
+        *truncated = true;
+    } else {
+        memcpy(out + *used, text, len);
+        *used += len;
+    }
+    out[*used] = 0;
+}
+
+/* tostring-like conversion without allocating or invoking __tostring. */
+static void add_value(lua_State *L, int idx, char *out, size_t cap, size_t *used, bool *truncated)
+{
+    const char *text;
+    size_t len;
+    char num[64];
+    switch (lua_type(L, idx)) {
+    case LUA_TNIL:
+        text = "nil";
+        len = 3;
+        break;
+    case LUA_TBOOLEAN:
+        text = lua_toboolean(L, idx) ? "true" : "false";
+        len = strlen(text);
+        break;
+    case LUA_TNUMBER: {
+        int n = _snprintf_s(num, sizeof(num), _TRUNCATE, "%.14g", (double)lua_tonumber(L, idx));
+        text = num;
+        len = n > 0 ? (size_t)n : 0;
+        break;
+    }
+    case LUA_TSTRING:
+        text = lua_tolstring(L, idx, &len);
+        break;
+    default:
+        text = luaL_typename(L, idx);
+        len = strlen(text);
+        break;
+    }
+    append_text(out, cap, used, text, len, truncated);
+}
+
+/* Builds the message of a log.* call from the whole stack, tab separated. */
+static void build_log_message(lua_State *L, char *out, size_t cap, bool *truncated)
+{
+    size_t used = 0;
+    *truncated = false;
+    out[0] = 0;
+    /* Leave room for the marker: the message itself never fills the buffer. */
+    size_t limit = cap > 4 ? cap - 3 : cap;
+    int n = lua_gettop(L);
+    for (int i = 1; i <= n; ++i) {
+        if (i > 1) append_text(out, limit, &used, "\t", 1, truncated);
+        add_value(L, i, out, limit, &used, truncated);
+    }
+    if (*truncated && used + 3 < cap) {
+        out[used++] = '.';
+        out[used++] = '.';
+        out[used++] = '.';
+        out[used] = 0;
+    } else if (*truncated) {
+        out[cap - 1] = 0;
+    }
+}
+
+/* One WARN line when a rate window ends with dropped lines. */
+static void flush_log_summary(Script *s, double now)
+{
+    if (s->log_dropped <= 0 || now < s->log_window + SCRIPT_LOG_WINDOW) return;
+    int dropped = s->log_dropped;
+    s->log_dropped = 0;
+    s->log_count = 0;
+    s->log_window = now;
+    char tag[160];
+    script_tag(s, tag, sizeof(tag));
+    log_log(LOG_WARN, tag, 0, "dropped %d log line(s)", dropped);
+}
+
+/* Accounts for one log call and refreshes the rate window. Kept separate from
+ * the message construction so dropped lines cost nothing. */
+static bool script_log_begin(Script *s)
+{
+    double now = script_now(s);
+    if (now - s->log_window >= SCRIPT_LOG_WINDOW) {
+        flush_log_summary(s, now);
+        s->log_count = 0;
+        s->log_window = now;
+    }
+    if (s->log_count >= SCRIPT_LOG_PER_SEC) {
+        ++s->log_dropped;
+        return false;
+    }
+    ++s->log_count;
+    return true;
+}
+
+static void script_log_write(Script *s, int level, const char *msg)
+{
+    char tag[160];
+    script_tag(s, tag, sizeof(tag));
+    log_log(level, tag, 0, "%s", msg);
+}
+
+static void script_log(Script *s, int level, const char *msg)
+{
+    if (script_log_begin(s)) script_log_write(s, level, msg);
+}
+
+static int log_call(lua_State *L, int level)
+{
+    Script *s = self(L);
+    if (!script_log_begin(s)) return 0;
+    char msg[SCRIPT_LOG_MAX];
+    bool truncated;
+    build_log_message(L, msg, sizeof(msg), &truncated);
+    script_log_write(s, level, msg);
+    return 0;
+}
+
+static int l_log_trace(lua_State *L) { return log_call(L, LOG_TRACE); }
+static int l_log_debug(lua_State *L) { return log_call(L, LOG_DEBUG); }
+static int l_log_info(lua_State *L) { return log_call(L, LOG_INFO); }
+static int l_log_warn(lua_State *L) { return log_call(L, LOG_WARN); }
+static int l_log_error(lua_State *L) { return log_call(L, LOG_ERROR); }
+static int l_log_fatal(lua_State *L) { return log_call(L, LOG_FATAL); }
+
+/* print -> INFO log; keeps its old tostring/tab formatting (unlike log.*,
+ * which never calls __tostring and never raises). Documented in README. */
 static int l_print(lua_State *L)
 {
     Script *s = self(L);
+    int n = lua_gettop(L); /* Before luaL_buffinit pushes its buffer placeholder. */
+    if (!script_log_begin(s)) return 0; /* Do not allocate/metamethod for a dropped line. */
     luaL_Buffer b;
     luaL_buffinit(L, &b);
-    luaL_addstring(&b, "[YAGP ");
-    luaL_addstring(&b, s->name);
-    luaL_addstring(&b, "] ");
-    int n = lua_gettop(L);
     for (int i = 1; i <= n; ++i) {
         if (i > 1) luaL_addchar(&b, '\t');
         luaL_tolstring(L, i, NULL);
         luaL_addvalue(&b);
     }
-    luaL_addchar(&b, '\n');
     luaL_pushresult(&b);
-    wchar_t text[1024];
-    to_wide(lua_tostring(L, -1), text, 1024);
-    OutputDebugStringW(text);
+    const char *text = lua_tostring(L, -1);
+    char msg[SCRIPT_LOG_MAX];
+    strncpy_s(msg, sizeof(msg), text ? text : "", _TRUNCATE);
+    script_log_write(s, LOG_INFO, msg);
     return 0;
 }
 
@@ -849,6 +1005,59 @@ static const ScriptHostExtOps *ext(lua_State *L)
     return self(L)->ext;
 }
 
+/* One WARN line when a notify window ends with suppressed calls. */
+static void flush_notify_summary(Script *s, double now)
+{
+    if (s->notify_dropped <= 0 || now < s->notify_window) return;
+    int dropped = s->notify_dropped;
+    s->notify_dropped = 0;
+    char tag[160];
+    script_tag(s, tag, sizeof(tag));
+    log_log(LOG_WARN, tag, 0, "suppressed %d notification(s)", dropped);
+}
+
+/* yagp.notify([title,] text) -> true if shown, false if throttled/unavailable. */
+static int l_notify(lua_State *L)
+{
+    Script *s = self(L);
+    int n = lua_gettop(L);
+    char title[256] = "YAGP";
+    char text[1024] = "";
+    bool truncated = false;
+    size_t used = 0;
+
+    if (n >= 2) {
+        add_value(L, 1, title, sizeof(title), &used, &truncated);
+        used = 0;
+        truncated = false;
+        add_value(L, 2, text, sizeof(text), &used, &truncated);
+    } else if (n == 1) {
+        add_value(L, 1, text, sizeof(text), &used, &truncated);
+    }
+    if (truncated && used + 3 < sizeof(text)) {
+        memcpy(text + used, "...", 3);
+        text[used + 3] = 0;
+    }
+
+    double now = script_now(s);
+    flush_notify_summary(s, now);
+    if (now < s->notify_next) {
+        if (s->notify_dropped == 0) s->notify_window = s->notify_next;
+        ++s->notify_dropped;
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+    s->notify_next = now + SCRIPT_NOTIFY_WINDOW;
+    bool shown = s->ext && s->ext->notify ? s->ext->notify(s->ctx, title, text) : false;
+    if (shown) {
+        char msg[SCRIPT_LOG_MAX + 160];
+        _snprintf_s(msg, sizeof(msg), _TRUNCATE, "notify: %s | %s", title, text);
+        script_log(s, LOG_INFO, msg);
+    }
+    lua_pushboolean(L, shown ? 1 : 0);
+    return 1;
+}
+
 static const char *check_clip_name(lua_State *L, int arg)
 {
     size_t n;
@@ -1152,7 +1361,14 @@ static const luaL_Reg yagp_lib[] = {
     {"set_matrix", l_set_matrix}, {"set_transform", l_set_transform},
     {"reset_transform", l_reset_transform}, {"set_opacity", l_set_opacity},
     {"set_cursor", l_set_cursor}, {"set_draggable", l_set_draggable},
-    {"set_clickthrough", l_set_clickthrough},
+    {"set_clickthrough", l_set_clickthrough}, {"notify", l_notify},
+    {NULL, NULL}
+};
+
+/* The global `log` table (documented as log.info/log.warn/...). */
+static const luaL_Reg log_lib[] = {
+    {"trace", l_log_trace}, {"debug", l_log_debug}, {"info", l_log_info},
+    {"warn", l_log_warn},   {"error", l_log_error}, {"fatal", l_log_fatal},
     {NULL, NULL}
 };
 
@@ -1531,6 +1747,8 @@ static int open_sandbox(lua_State *L)
     lua_pop(L, 1);
     lua_pushcfunction(L, l_print);
     lua_setglobal(L, "print");
+    luaL_newlib(L, log_lib);
+    lua_setglobal(L, "log");
     lua_getglobal(L, "setmetatable");
     lua_pushcclosure(L, l_setmetatable, 1);
     lua_setglobal(L, "setmetatable");
@@ -1711,14 +1929,26 @@ bool script_plain_event(Script *s, ScriptEvent ev, wchar_t *err, size_t err_cap)
 double script_next_timer(Script *s)
 {
     double best = -1;
-    for (int i = 0; s && i < s->timer_count; ++i) {
+    if (!s) return -1;
+    for (int i = 0; i < s->timer_count; ++i) {
         if (best < 0 || s->timers[i].due < best) best = s->timers[i].due;
+    }
+    /* Pending rate-limit summaries are serviced through the same timer path. */
+    if (s->log_dropped > 0) {
+        double t = s->log_window + SCRIPT_LOG_WINDOW;
+        if (best < 0 || t < best) best = t;
+    }
+    if (s->notify_dropped > 0) {
+        double t = s->notify_window;
+        if (best < 0 || t < best) best = t;
     }
     return best;
 }
 
 bool script_run_timers(Script *s, double now, wchar_t *err, size_t err_cap)
 {
+    flush_log_summary(s, now);
+    flush_notify_summary(s, now);
     double next = script_next_timer(s);
     if (next < 0 || next > now) return true;
     Call c;

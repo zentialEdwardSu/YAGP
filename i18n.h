@@ -22,6 +22,8 @@
 #define TXT_MENU_PAUSE_ALL         L"Pause all"
 #define TXT_MENU_RESUME_ALL        L"Resume all"
 #define TXT_MENU_AUTOSTART         L"Start with Windows"
+#define TXT_MENU_LOG_START         L"Enable logging…"
+#define TXT_MENU_LOG_STOP          L"Stop logging"
 #define TXT_MENU_CLEAR_CONFIG      L"Delete settings data…"
 #define TXT_MENU_EXIT              L"Exit"
 #define TXT_TAG_PAUSED             L"  (paused)"
@@ -70,6 +72,8 @@
 #define TXT_HIDDEN_TEXT            L"It stays in the tray menu. Show it again from its submenu there."
 #define TXT_CONFIG_DELETED         L"Settings deleted"
 #define TXT_SCRIPT_STOPPED_TITLE   L"Motion script stopped: %s"
+#define TXT_LOG_STOPPED_TITLE      L"Logging stopped"
+#define TXT_LOG_STOPPED_TEXT       L"Logging stopped automatically; the log file is closed."
 #define TXT_UNKNOWN_ERROR          L"Unknown error"
 
 /* ---- errors (one %s argument unless noted) -------------------------------- */
@@ -81,6 +85,7 @@
 #define TXT_ERR_PICKER             L"Cannot start the file picker:\n%s"
 #define TXT_ERR_TOO_MANY_FILES     L"Too many files selected at once. Please add them in smaller batches."
 #define TXT_ERR_AUTOSTART          L"Cannot change the startup setting (%s)."
+#define TXT_ERR_LOG_OPEN           L"Cannot create the log file in this folder:\n%s"
 #define TXT_ERR_DELETE_CONFIG      L"Cannot delete the settings folder:\n%s"
 #define TXT_ERR_DELETE_AUTOSTART   L"Cannot delete the startup entry:\n%s"
 #define TXT_ERR_WRITE_SCRIPT       L"Cannot write the script file"     /* Message box title, no argument. */
@@ -96,6 +101,7 @@
 #define TXT_TITLE_REPLACE_GIF      L"Replace GIF"
 #define TXT_TITLE_PICK_SCRIPT      L"Choose motion script"
 #define TXT_TITLE_NEW_SCRIPT       L"New motion script from preset"
+#define TXT_TITLE_PICK_LOG_DIR     L"Choose log folder"
 #define TXT_FILTER_GIF             L"GIF animations (*.gif)\0*.gif\0All files\0*.*\0\0"
 #define TXT_FILTER_LUA             L"Lua scripts (*.lua)\0*.lua\0All files\0*.*\0\0"
 #define TXT_FILTER_LUA_ONLY        L"Lua scripts (*.lua)\0*.lua\0\0"
@@ -136,6 +142,8 @@
 #define TXT_MENU_PAUSE_ALL         L"全部暂停"
 #define TXT_MENU_RESUME_ALL        L"全部继续"
 #define TXT_MENU_AUTOSTART         L"开机自启动"
+#define TXT_MENU_LOG_START         L"启用日志记录…"
+#define TXT_MENU_LOG_STOP          L"停止日志记录"
 #define TXT_MENU_CLEAR_CONFIG      L"删除配置数据…"
 #define TXT_MENU_EXIT              L"退出"
 #define TXT_TAG_PAUSED             L"  (已暂停)"
@@ -184,6 +192,8 @@
 #define TXT_HIDDEN_TEXT            L"它仍在托盘菜单里，可在对应 GIF 的子菜单中重新显示。"
 #define TXT_CONFIG_DELETED         L"配置已删除"
 #define TXT_SCRIPT_STOPPED_TITLE   L"运动脚本已停止：%s"
+#define TXT_LOG_STOPPED_TITLE      L"日志记录已停止"
+#define TXT_LOG_STOPPED_TEXT       L"日志记录已自动停止，日志文件已关闭。"
 #define TXT_UNKNOWN_ERROR          L"未知错误"
 
 /* ---- errors (one %s argument unless noted) -------------------------------- */
@@ -195,6 +205,7 @@
 #define TXT_ERR_PICKER             L"无法启动文件选择器：\n%s"
 #define TXT_ERR_TOO_MANY_FILES     L"一次选择的文件过多，请分批添加。"
 #define TXT_ERR_AUTOSTART          L"无法修改开机自启动设置（%s）。"
+#define TXT_ERR_LOG_OPEN           L"无法在该文件夹创建日志文件：\n%s"
 #define TXT_ERR_DELETE_CONFIG      L"无法删除配置目录：\n%s"
 #define TXT_ERR_DELETE_AUTOSTART   L"无法删除开机自启动项：\n%s"
 #define TXT_ERR_WRITE_SCRIPT       L"无法写入脚本文件"                 /* Message box title, no argument. */
@@ -210,6 +221,7 @@
 #define TXT_TITLE_REPLACE_GIF      L"更换 GIF"
 #define TXT_TITLE_PICK_SCRIPT      L"选择运动脚本"
 #define TXT_TITLE_NEW_SCRIPT       L"基于预设新建运动脚本"
+#define TXT_TITLE_PICK_LOG_DIR     L"选择日志文件夹"
 #define TXT_FILTER_GIF             L"GIF 动画 (*.gif)\0*.gif\0所有文件\0*.*\0\0"
 #define TXT_FILTER_LUA             L"Lua 脚本 (*.lua)\0*.lua\0所有文件\0*.*\0\0"
 #define TXT_FILTER_LUA_ONLY        L"Lua 脚本 (*.lua)\0*.lua\0\0"

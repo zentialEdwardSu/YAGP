@@ -1,8 +1,10 @@
 #include "app.h"
+#include "applog.h"
 #include "config.h"
 #include "cursor_hook.h"
 #include "frame_cache.h"
 #include "i18n.h"
+#include "log.h"
 #include "monitors.h"
 #include "overlay.h"
 
@@ -25,6 +27,9 @@
 #define COPYDATA_ADD_FILES 0x59414750u   /* 'YAGP': paths from a second instance */
 #define COPYDATA_PICK_RESULT 0x5941504Bu /* 'YAPK': paths from the --pick helper */
 #define WM_TRAY (WM_APP + 1)
+/* Logging stopped by itself (session limit or a write error): show the balloon.
+ * Posted by the applog stop callback, which may run on any thread. */
+#define WM_APP_LOG_STOPPED (WM_APP + 6)
 #define TRAY_UID 1
 
 enum { TIMER_MODAL_TICK = 1, TIMER_SAVE, TIMER_DEVICE_RETRY };
@@ -34,6 +39,7 @@ enum {
     TRAY_CMD_RESUME_ALL,
     TRAY_CMD_CLEAR_CONFIG,
     TRAY_CMD_AUTOSTART,
+    TRAY_CMD_LOG,
     TRAY_CMD_EXIT,
     TRAY_CMD_OVERLAY_BASE = 1000
 };
@@ -76,10 +82,12 @@ static void recover_device(void)
     render_device_destroy(g_app.device);
     g_app.device = render_device_create();
     if (!g_app.device) {
+        log_error("device recreation failed; retrying in 2 s");
         SetTimer(g_app.tray_hwnd, TIMER_DEVICE_RETRY, 2000, NULL);
         return;
     }
     KillTimer(g_app.tray_hwnd, TIMER_DEVICE_RETRY);
+    log_info("D3D11 device recreated");
     for (Overlay *o = g_app.overlays; o; o = o->next) {
         overlay_attach_surface(o);
         o->next_frame = app_now();
@@ -89,6 +97,7 @@ static void recover_device(void)
 static void app_tick(void)
 {
     if (!g_app.device || render_device_lost(g_app.device)) {
+        log_warn("device lost; recreating");
         recover_device();
         app_reschedule();
         return;
@@ -174,10 +183,17 @@ static void add_overlay_from_path(const wchar_t *path, void *ctx)
 
 static void restore_overlay(const OverlayConfig *cfg, void *ctx)
 {
-    (void)ctx;
-    if (GetFileAttributesW(cfg->path) == INVALID_FILE_ATTRIBUTES) return; /* File moved away. */
+    int *count = (int *)ctx;
+    if (GetFileAttributesW(cfg->path) == INVALID_FILE_ATTRIBUTES) {
+        char u8[MAX_PATH * 4];
+        log_warn("skipping missing GIF: %s", applog_u8(cfg->path, u8, sizeof(u8)));
+        return;
+    }
     Overlay *o = overlay_create(cfg, true, s_cascade++);
-    if (o) link_overlay(o);
+    if (o) {
+        link_overlay(o);
+        if (count) ++*count;
+    }
 }
 
 void app_remove_overlay(Overlay *o)
@@ -191,6 +207,8 @@ void app_remove_overlay(Overlay *o)
             *p = o->next;
             o->next = NULL;
             if (!o->hidden) overlay_announce(o, false);
+            char u8[MAX_PATH * 4];
+            log_info("removed GIF #%d: %s", o->id, applog_u8(overlay_name(o), u8, sizeof(u8)));
             overlay_destroy(o);
             break;
         }
@@ -234,7 +252,10 @@ UINT app_track_menu(HMENU menu, int x, int y)
 
 static void pick_close(void)
 {
-    if (g_app.pick_process) CloseHandle(g_app.pick_process);
+    if (g_app.pick_process) {
+        CloseHandle(g_app.pick_process);
+        log_debug("picker helper exited");
+    }
     g_app.pick_process = NULL;
     g_app.pick_pid = 0;
 }
@@ -257,6 +278,7 @@ static const wchar_t *pick_verb(PickKind kind)
     case PICK_REPLACE: return L"replace";
     case PICK_SCRIPT: return L"script";
     case PICK_NEW_SCRIPT: return L"newscript";
+    case PICK_LOG_DIR: return L"logdir";
     default: return L"add";
     }
 }
@@ -268,15 +290,19 @@ static void launch_picker(PickKind kind, Overlay *target, const wchar_t *extra)
         if ((int)kind == g_app.pick_kind && target == g_app.pick_target) {
             AllowSetForegroundWindow(g_app.pick_pid);
             EnumWindows(focus_pick_window, (LPARAM)g_app.pick_pid);
+            log_debug("picker already open (pid %lu)", (unsigned long)g_app.pick_pid);
             return;
         }
         TerminateProcess(g_app.pick_process, 0); /* A different request supersedes it. */
     }
     pick_close();
 
-    wchar_t exe[MAX_PATH * 4], cmd[MAX_PATH * 4 + 256];
+    wchar_t exe[MAX_PATH * 4], cmd[MAX_PATH * 8 + 512];
     DWORD n = GetModuleFileNameW(NULL, exe, ARRAYSIZE(exe));
-    if (!n || n >= ARRAYSIZE(exe)) return;
+    if (!n || n >= ARRAYSIZE(exe)) {
+        log_error("cannot resolve the executable path for the picker");
+        return;
+    }
     /* Unguessable-enough id so stale or forged results are ignored. */
     uint64_t id = (uint64_t)app_now() * 6364136223846793005ull ^ (GetTickCount64() << 21) ^
                   (uint64_t)GetCurrentProcessId();
@@ -289,6 +315,10 @@ static void launch_picker(PickKind kind, Overlay *target, const wchar_t *extra)
     memset(&si, 0, sizeof(si));
     si.cb = sizeof(si);
     if (!CreateProcessW(exe, cmd, NULL, NULL, FALSE, CREATE_SUSPENDED, NULL, NULL, &si, &pi)) {
+        DWORD err = GetLastError();
+        char u8[MAX_PATH * 4];
+        log_error("cannot start file picker: %s (error %lu)", applog_u8(exe, u8, sizeof(u8)),
+                  (unsigned long)err);
         app_error(TXT_ERR_PICKER, exe);
         return;
     }
@@ -296,6 +326,7 @@ static void launch_picker(PickKind kind, Overlay *target, const wchar_t *extra)
     AllowSetForegroundWindow(pi.dwProcessId);
     ResumeThread(pi.hThread);
     CloseHandle(pi.hThread);
+    log_info("picker start: %s (pid %lu)", pick_verb(kind), (unsigned long)pi.dwProcessId);
     g_app.pick_process = pi.hProcess;
     g_app.pick_pid = pi.dwProcessId;
     g_app.pick_id = id;
@@ -315,6 +346,24 @@ void app_new_script(Overlay *target, const wchar_t *resource, const wchar_t *fil
     launch_picker(PICK_NEW_SCRIPT, target, extra);
 }
 
+/* Folder picker for "enable logging". The helper starts in the folder used
+ * earlier in this run, or in Documents when this is the first time. */
+static void app_pick_log_dir(void)
+{
+    const wchar_t *dir = applog_last_dir();
+    if (dir && *dir) {
+        wchar_t extra[MAX_PATH * 4 + 4];
+        size_t n = wcslen(dir);
+        /* A trailing backslash would escape the closing quote for the helper's
+         * CommandLineToArgvW; root directories are the only paths like this. */
+        bool trailing = n && (dir[n - 1] == L'\\' || dir[n - 1] == L'/');
+        _snwprintf_s(extra, ARRAYSIZE(extra), _TRUNCATE, L"\"%s%s\"", dir, trailing ? L"\\" : L"");
+        launch_picker(PICK_LOG_DIR, NULL, extra);
+    } else {
+        launch_picker(PICK_LOG_DIR, NULL, NULL);
+    }
+}
+
 /* Payload: uint64 id, then NUL separated full paths, double-NUL terminated. */
 static void handle_pick_result(const COPYDATASTRUCT *cds)
 {
@@ -326,18 +375,47 @@ static void handle_pick_result(const COPYDATASTRUCT *cds)
     const wchar_t *p = (const wchar_t *)((const uint8_t *)cds->lpData + sizeof(uint64_t));
     const wchar_t *end = p + (cds->cbData - sizeof(uint64_t)) / sizeof(wchar_t);
     if (end[-1] != 0) return;
+    if (g_app.pick_kind == PICK_LOG_DIR) {
+        if (!*p) {
+            log_debug("picker returned no path");
+            return;
+        }
+        if (applog_state() != APPLOG_OFF) {
+            log_debug("log directory result ignored: logging is already on");
+            return;
+        }
+        DWORD err = 0;
+        if (!applog_start(p, &err)) {
+            char u8[MAX_PATH * 4];
+            log_error("cannot create log file in %s (error %lu)", applog_u8(p, u8, sizeof(u8)),
+                      (unsigned long)err);
+            app_error(TXT_ERR_LOG_OPEN, p);
+        }
+        return;
+    }
     if (g_app.pick_kind == PICK_REPLACE) {
-        if (g_app.pick_target && *p) overlay_replace(g_app.pick_target, p);
+        if (g_app.pick_target && *p) {
+            char u8[MAX_PATH * 4];
+            log_info("picker result: replace %s", applog_u8(p, u8, sizeof(u8)));
+            overlay_replace(g_app.pick_target, p);
+        }
         return;
     }
     if (g_app.pick_kind == PICK_SCRIPT || g_app.pick_kind == PICK_NEW_SCRIPT) {
         if (g_app.pick_target && *p) {
+            char u8[MAX_PATH * 4];
+            log_info("picker result: script %s", applog_u8(p, u8, sizeof(u8)));
             overlay_set_script(g_app.pick_target, p);
             app_changed();
         }
         return;
     }
-    for (; p < end && *p; p += wcslen(p) + 1) add_overlay_from_path(p, NULL);
+    int count = 0;
+    for (; p < end && *p; p += wcslen(p) + 1) {
+        ++count;
+        add_overlay_from_path(p, NULL);
+    }
+    log_info("picker result: add %d path(s)", count);
 }
 
 /* Sends "id + path\0\0" to the tray. */
@@ -416,12 +494,63 @@ static int run_new_script(int argc, wchar_t **argv, uint64_t id)
     return 0;
 }
 
+/* Initial folder for the log folder picker. */
+static int CALLBACK browse_init(HWND hwnd, UINT msg, LPARAM lp, LPARAM data)
+{
+    (void)lp;
+    if (msg == BFFM_INITIALIZED && data) SendMessageW(hwnd, BFFM_SETSELECTIONW, TRUE, data);
+    return 0;
+}
+
+/* "--pick logdir <id> [<initial folder>]": choose where the log file goes. */
+static int run_pick_log_dir(int argc, wchar_t **argv, uint64_t id)
+{
+    wchar_t initial[MAX_PATH * 2] = L"";
+    if (argc > 4 && argv[4]) wcsncpy_s(initial, ARRAYSIZE(initial), argv[4], _TRUNCATE);
+    if (!initial[0]) {
+        PWSTR docs = NULL;
+        if (SUCCEEDED(SHGetKnownFolderPath(&FOLDERID_Documents, 0, NULL, &docs))) {
+            wcsncpy_s(initial, ARRAYSIZE(initial), docs, _TRUNCATE);
+            CoTaskMemFree(docs);
+        }
+    }
+
+    BROWSEINFOW bi;
+    memset(&bi, 0, sizeof(bi));
+    wchar_t display[MAX_PATH] = L"";
+    bi.pszDisplayName = display;
+    bi.lpszTitle = TXT_TITLE_PICK_LOG_DIR;
+    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_USENEWUI;
+    bi.lpfn = browse_init;
+    bi.lParam = (LPARAM)(initial[0] ? initial : NULL);
+    PIDLIST_ABSOLUTE pidl = SHBrowseForFolderW(&bi);
+    if (!pidl) return 0; /* Cancelled. */
+    wchar_t path[MAX_PATH * 2];
+    bool ok = SHGetPathFromIDListW(pidl, path) != FALSE;
+    CoTaskMemFree(pidl);
+    if (!ok) return 1;
+
+    size_t used = wcslen(path) + 2; /* "path\0\0" */
+    wchar_t *out = (wchar_t *)calloc(used, sizeof(wchar_t));
+    if (!out) return 1;
+    memcpy(out, path, (used - 2) * sizeof(wchar_t));
+    send_pick_result(id, out, used);
+    free(out);
+    return 0;
+}
+
 /* Entry point of the helper process. Returns the process exit code. */
 static int run_picker(int argc, wchar_t **argv)
 {
     if (argc >= 4 && wcscmp(argv[2], L"newscript") == 0) {
         HRESULT com = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
         int rc = run_new_script(argc, argv, wcstoull(argv[3], NULL, 16));
+        if (SUCCEEDED(com)) CoUninitialize();
+        return rc;
+    }
+    if (argc >= 4 && wcscmp(argv[2], L"logdir") == 0) {
+        HRESULT com = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        int rc = run_pick_log_dir(argc, argv, wcstoull(argv[3], NULL, 16));
         if (SUCCEEDED(com)) CoUninitialize();
         return rc;
     }
@@ -500,7 +629,7 @@ static void tray_icon_data(NOTIFYICONDATAW *nid)
     nid->uID = TRAY_UID;
 }
 
-void app_notify(const wchar_t *title, const wchar_t *text)
+bool app_notify(const wchar_t *title, const wchar_t *text)
 {
     NOTIFYICONDATAW nid;
     tray_icon_data(&nid);
@@ -508,7 +637,7 @@ void app_notify(const wchar_t *title, const wchar_t *text)
     nid.dwInfoFlags = NIIF_INFO | NIIF_NOSOUND;
     wcsncpy_s(nid.szInfoTitle, ARRAYSIZE(nid.szInfoTitle), title, _TRUNCATE);
     wcsncpy_s(nid.szInfo, ARRAYSIZE(nid.szInfo), text, _TRUNCATE);
-    Shell_NotifyIconW(NIM_MODIFY, &nid);
+    return Shell_NotifyIconW(NIM_MODIFY, &nid) != FALSE;
 }
 
 void app_error(const wchar_t *fmt, const wchar_t *arg)
@@ -518,6 +647,14 @@ void app_error(const wchar_t *fmt, const wchar_t *arg)
     app_modal_begin();
     MessageBoxW(g_app.tray_hwnd, text, L"YAGP", MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
     app_modal_end();
+}
+
+/* applog can stop by itself (session limit or a write error) on any thread;
+ * marshal the balloon to the UI thread. */
+static void log_stopped_cb(void *ctx)
+{
+    (void)ctx;
+    if (g_app.tray_hwnd) PostMessageW(g_app.tray_hwnd, WM_APP_LOG_STOPPED, 0, 0);
 }
 
 /* app.ico (resource 1, from specturebot.png) at the small-icon size, so the
@@ -537,16 +674,23 @@ static void tray_add_icon(void)
     nid.uCallbackMessage = WM_TRAY;
     nid.hIcon = g_app.tray_icon;
     wcsncpy_s(nid.szTip, ARRAYSIZE(nid.szTip), TXT_TRAY_TIP, _TRUNCATE);
-    Shell_NotifyIconW(NIM_ADD, &nid);
+    BOOL added = Shell_NotifyIconW(NIM_ADD, &nid);
+    if (added) {
+        log_debug("tray icon added");
+    } else {
+        log_warn("tray icon add failed (error %lu)", (unsigned long)GetLastError());
+    }
     nid.uVersion = NOTIFYICON_VERSION_4;
-    Shell_NotifyIconW(NIM_SETVERSION, &nid);
+    if (!Shell_NotifyIconW(NIM_SETVERSION, &nid))
+        log_warn("tray icon version failed (error %lu)", (unsigned long)GetLastError());
 }
 
 static void tray_remove_icon(void)
 {
     NOTIFYICONDATAW nid;
     tray_icon_data(&nid);
-    Shell_NotifyIconW(NIM_DELETE, &nid);
+    if (Shell_NotifyIconW(NIM_DELETE, &nid)) log_debug("tray icon removed");
+    else log_warn("tray icon remove failed (error %lu)", (unsigned long)GetLastError());
 }
 
 /* ---- tray menu ----------------------------------------------------------- */
@@ -584,14 +728,22 @@ static void autostart_set(bool enable)
     LSTATUS rc;
     if (enable) {
         wchar_t cmd[MAX_PATH * 4 + 2];
-        if (!autostart_command(cmd, ARRAYSIZE(cmd))) return;
+        if (!autostart_command(cmd, ARRAYSIZE(cmd))) {
+            log_error("cannot resolve the executable path for autostart");
+            return;
+        }
         rc = RegSetKeyValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE, REG_SZ, cmd,
                              (DWORD)((wcslen(cmd) + 1) * sizeof(wchar_t)));
     } else {
         rc = RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE);
         if (rc == ERROR_FILE_NOT_FOUND) rc = ERROR_SUCCESS;
     }
-    if (rc != ERROR_SUCCESS) app_error(TXT_ERR_AUTOSTART, L"HKCU\\...\\Run");
+    if (rc != ERROR_SUCCESS) {
+        log_error("cannot update autostart (error %ld)", (long)rc);
+        app_error(TXT_ERR_AUTOSTART, L"HKCU\\...\\Run");
+    } else {
+        log_info("autostart %s", enable ? "enabled" : "disabled");
+    }
 }
 
 /* ---- delete all data --------------------------------------------------------
@@ -601,13 +753,18 @@ static void clear_config(void)
 {
     wchar_t dir[MAX_PATH];
     wchar_t text[MAX_PATH * 2 + 384];
-    if (!config_dir(dir, MAX_PATH)) return;
+    if (!config_dir(dir, MAX_PATH)) {
+        log_error("cannot resolve the settings folder");
+        return;
+    }
     _snwprintf_s(text, ARRAYSIZE(text), _TRUNCATE, TXT_CLEAR_CONFIRM, dir, g_app.cache_dir,
                  L"HKCU\\...\\Run\\" RUN_VALUE);
     app_modal_begin();
     int answer = MessageBoxW(g_app.tray_hwnd, text, L"YAGP", MB_OKCANCEL | MB_ICONQUESTION | MB_SETFOREGROUND);
     app_modal_end();
     if (answer != IDOK) return;
+    char u8[MAX_PATH * 4];
+    log_info("deleting settings data: %s", applog_u8(dir, u8, sizeof(u8)));
     KillTimer(g_app.tray_hwnd, TIMER_SAVE);
     g_app.cache_dir[0] = 0; /* Stop writing cache files for the rest of this run. */
     frame_cache_delete_all();
@@ -615,9 +772,16 @@ static void clear_config(void)
     bool run_ok = run == ERROR_SUCCESS || run == ERROR_FILE_NOT_FOUND;
     bool config_ok = config_delete_all();
     if (config_ok) g_app.persist = false;
-    if (config_ok && run_ok) app_notify(TXT_CONFIG_DELETED, dir);
-    else if (!config_ok) app_error(TXT_ERR_DELETE_CONFIG, dir);
-    else app_error(TXT_ERR_DELETE_AUTOSTART, L"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\" RUN_VALUE);
+    if (config_ok && run_ok) {
+        log_info("settings data deleted: %s", applog_u8(dir, u8, sizeof(u8)));
+        app_notify(TXT_CONFIG_DELETED, dir);
+    } else if (!config_ok) {
+        log_error("cannot delete settings data: %s", applog_u8(dir, u8, sizeof(u8)));
+        app_error(TXT_ERR_DELETE_CONFIG, dir);
+    } else {
+        log_error("cannot delete autostart entry (error %ld)", (long)run);
+        app_error(TXT_ERR_DELETE_AUTOSTART, L"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\" RUN_VALUE);
+    }
 }
 
 static void show_tray_menu(void)
@@ -646,6 +810,9 @@ static void show_tray_menu(void)
     AppendMenuW(menu, MF_STRING | (any_paused ? 0 : MF_GRAYED), TRAY_CMD_RESUME_ALL, TXT_MENU_RESUME_ALL);
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING | (autostart_enabled() ? MF_CHECKED : 0), TRAY_CMD_AUTOSTART, TXT_MENU_AUTOSTART);
+    AppLogState log = applog_state();
+    AppendMenuW(menu, MF_STRING, TRAY_CMD_LOG,
+                log == APPLOG_ON ? TXT_MENU_LOG_STOP : TXT_MENU_LOG_START);
     AppendMenuW(menu, MF_STRING, TRAY_CMD_CLEAR_CONFIG, TXT_MENU_CLEAR_CONFIG);
     AppendMenuW(menu, MF_STRING, TRAY_CMD_EXIT, TXT_MENU_EXIT);
 
@@ -676,6 +843,10 @@ static void show_tray_menu(void)
     case TRAY_CMD_AUTOSTART:
         autostart_set(!autostart_enabled());
         break;
+    case TRAY_CMD_LOG:
+        if (applog_state() == APPLOG_ON) applog_stop();
+        else app_pick_log_dir();
+        break;
     case TRAY_CMD_CLEAR_CONFIG:
         clear_config();
         break;
@@ -701,14 +872,18 @@ static void handle_copydata(const COPYDATASTRUCT *cds)
         app_pick_files(PICK_ADD, NULL);
         return;
     }
+    int paths = 0;
     while (p < (const wchar_t *)cds->lpData + n && *p) {
+        ++paths;
         add_overlay_from_path(p, NULL);
         p += wcslen(p) + 1;
     }
+    log_info("received %d path(s) from another instance", paths);
 }
 
-static wchar_t *pack_args(int argc, wchar_t **argv, DWORD *bytes)
+static wchar_t *pack_args(int argc, wchar_t **argv, DWORD *bytes, int *count)
 {
+    if (count) *count = 0;
     size_t total = 1;
     wchar_t full[MAX_PATH * 4];
     for (int i = 1; i < argc; ++i) {
@@ -719,35 +894,66 @@ static wchar_t *pack_args(int argc, wchar_t **argv, DWORD *bytes)
     wchar_t *buf = (wchar_t *)calloc(total, sizeof(wchar_t));
     if (!buf) return NULL;
     wchar_t *w = buf;
+    int n = 0;
     for (int i = 1; i < argc; ++i) {
         DWORD len = GetFullPathNameW(argv[i], ARRAYSIZE(full), full, NULL);
         if (len && len < ARRAYSIZE(full)) {
             memcpy(w, full, (len + 1) * sizeof(wchar_t));
             w += len + 1;
+            ++n;
         }
     }
+    if (count) *count = n;
     *bytes = (DWORD)(total * sizeof(wchar_t));
     return buf;
 }
 
-static void forward_to_running_instance(int argc, wchar_t **argv)
+/* Returns the number of paths actually put into the message (0 when no running
+ * instance accepted it). */
+static int forward_to_running_instance(int argc, wchar_t **argv)
 {
     HWND target = NULL;
     for (int i = 0; i < 50 && !target; ++i) { /* First instance may still be starting. */
         target = FindWindowW(TRAY_CLASS, NULL);
         if (!target) Sleep(100);
     }
-    if (!target) return;
+    if (!target) return 0;
     DWORD pid = 0;
     GetWindowThreadProcessId(target, &pid);
     AllowSetForegroundWindow(pid);
     DWORD bytes = 0;
-    wchar_t *payload = pack_args(argc, argv, &bytes);
-    if (!payload) return;
+    int count = 0;
+    wchar_t *payload = pack_args(argc, argv, &bytes, &count);
+    if (!payload) return 0;
     COPYDATASTRUCT cds = {COPYDATA_ADD_FILES, bytes, payload};
     DWORD_PTR result = 0;
     SendMessageTimeoutW(target, WM_COPYDATA, 0, (LPARAM)&cds, SMTO_ABORTIFHUNG, 5000, &result);
     free(payload);
+    return count;
+}
+
+static bool is_verbose_flag(const wchar_t *arg)
+{
+    return wcscmp(arg, L"--verbose") == 0 || wcscmp(arg, L"-v") == 0;
+}
+
+/* Removes --verbose/-v from argv[1..], keeping path order. The array has room
+ * for the closing NULL because it came from CommandLineToArgvW. */
+static bool strip_verbose_flags(int *argc, wchar_t **argv)
+{
+    if (!argc || !argv || *argc <= 1) return false;
+    bool found = false;
+    int n = 1;
+    for (int i = 1; i < *argc; ++i) {
+        if (is_verbose_flag(argv[i])) {
+            found = true;
+            continue;
+        }
+        argv[n++] = argv[i];
+    }
+    argv[n] = NULL;
+    *argc = n;
+    return found;
 }
 
 /* ---- tray window --------------------------------------------------------- */
@@ -789,6 +995,10 @@ static LRESULT CALLBACK tray_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         overlay_cache_ready((void *)lp);
         app_reschedule();
         return 0;
+    case WM_APP_LOG_STOPPED:
+        app_notify(TXT_LOG_STOPPED_TITLE, TXT_LOG_STOPPED_TEXT);
+        log_info("logging stopped automatically");
+        return 0;
     case WM_APP_CURSOR:
         overlay_cursor_moved();
         return 0;
@@ -802,6 +1012,7 @@ static LRESULT CALLBACK tray_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         /* Monitors added/removed/rearranged or a taskbar moved: let scripts
          * pull their GIF back into view. */
         monitors_refresh();
+        log_info("display change (0x%04X): %d monitor(s)", (unsigned)msg, monitors_count());
         for (Overlay *o = g_app.overlays; o; o = o->next) overlay_screens_changed(o);
         app_reschedule();
         return 0;
@@ -851,9 +1062,21 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmdline, int show)
         return rc;
     }
 
+    bool verbose = strip_verbose_flags(&argc, argv);
+    applog_init();
+    if (verbose) {
+        if (applog_attach_console()) log_info("verbose console output enabled");
+        else log_warn("--verbose: no terminal console available");
+    }
+
     HANDLE mutex = CreateMutexW(NULL, FALSE, INSTANCE_MUTEX);
     if (mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
-        if (argv) forward_to_running_instance(argc, argv);
+        int forwarded = argv ? forward_to_running_instance(argc, argv) : 0;
+        if (verbose) {
+            if (forwarded > 0) log_info("forwarded %d path(s) to the running instance", forwarded);
+            else log_warn("no path was forwarded to the running instance");
+        }
+        applog_shutdown();
         LocalFree(argv);
         CloseHandle(mutex);
         return 0;
@@ -865,18 +1088,34 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmdline, int show)
     g_app.instance = instance;
     g_app.qpc_freq = freq.QuadPart;
     g_app.persist = true;
+    log_info("YAGP starting: build %s %s", __DATE__, __TIME__);
+    {
+        wchar_t exe[MAX_PATH * 4];
+        DWORD n = GetModuleFileNameW(NULL, exe, ARRAYSIZE(exe));
+        if (n && n < ARRAYSIZE(exe)) {
+            char u8[MAX_PATH * 4];
+            log_info("executable: %s", applog_u8(exe, u8, sizeof(u8)));
+        }
+    }
     if (!frame_cache_default_dir(g_app.cache_dir, MAX_PATH)) g_app.cache_dir[0] = 0;
+    {
+        char u8[MAX_PATH * 4];
+        log_info("cache directory: %s", applog_u8(g_app.cache_dir, u8, sizeof(u8)));
+    }
     g_app.msg_taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
     g_app.frame_timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     if (!g_app.frame_timer) g_app.frame_timer = CreateWaitableTimerW(NULL, FALSE, NULL); /* Pre-1803 */
 
     int exit_code = 1;
     if (!g_app.frame_timer || !create_tray_window() || !overlay_register_class(instance)) {
+        log_error("window initialisation failed");
         MessageBoxW(NULL, TXT_ERR_INIT_WINDOW, L"YAGP", MB_OK | MB_ICONERROR);
         goto done;
     }
+    applog_set_stop_callback(log_stopped_cb, NULL);
     g_app.device = render_device_create();
     if (!g_app.device) {
+        log_error("D3D11 initialisation failed");
         MessageBoxW(NULL, TXT_ERR_INIT_D3D, L"YAGP", MB_OK | MB_ICONERROR);
         goto done;
     }
@@ -884,9 +1123,20 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmdline, int show)
     ChangeWindowMessageFilterEx(g_app.tray_hwnd, WM_COPYDATA, MSGFLT_ALLOW, NULL);
 
     monitors_refresh();
+    log_info("monitors: %d", monitors_count());
+    for (int i = 0; i < monitors_count(); ++i) {
+        const Monitor *m = monitors_get(i);
+        log_info("monitor %d: %dx%d at (%ld,%ld), work %dx%d at (%ld,%ld)%s", i,
+                 (int)(m->bounds.right - m->bounds.left), (int)(m->bounds.bottom - m->bounds.top),
+                 (long)m->bounds.left, (long)m->bounds.top,
+                 (int)(m->work.right - m->work.left), (int)(m->work.bottom - m->work.top),
+                 (long)m->work.left, (long)m->work.top, m->primary ? " (primary)" : "");
+    }
     g_app.tray_icon = make_tray_icon();
     tray_add_icon();
-    config_load(restore_overlay, NULL);
+    int restored = 0;
+    config_load(restore_overlay, &restored);
+    log_info("restored %d GIF(s) from config", restored);
     overlay_refresh_hook(); /* Restored scripts' cursor / input subscriptions. */
     for (int i = 1; argv && i < argc; ++i) {
         wchar_t full[MAX_PATH * 4];
@@ -926,6 +1176,8 @@ done:
     if (g_app.tray_hwnd && IsWindow(g_app.tray_hwnd)) DestroyWindow(g_app.tray_hwnd);
     if (g_app.tray_icon) DestroyIcon(g_app.tray_icon);
     if (g_app.frame_timer) CloseHandle(g_app.frame_timer);
+    log_info("YAGP exiting (code %d)", exit_code);
+    applog_shutdown();
     if (SUCCEEDED(com)) CoUninitialize();
     LocalFree(argv);
     if (mutex) CloseHandle(mutex);

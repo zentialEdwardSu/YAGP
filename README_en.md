@@ -18,16 +18,18 @@ default build shows the same entries in Chinese.
 
 ## Build
 
-Windows 10/11, Visual Studio 2022+ (MSVC), CMake 3.25+. giflib 5.2.2 and
-Lua 5.4.7 (both MIT) are pulled in by `FetchContent` at configure time
-(SHA-256 pinned). For offline builds pass
-`-DFETCHCONTENT_SOURCE_DIR_GIFLIB=<dir>` / `-DFETCHCONTENT_SOURCE_DIR_LUA=<dir>`.
+Windows 10/11, Visual Studio 2022+ (MSVC), CMake 3.25+. giflib 5.2.2, Lua 5.4.7
+and rxi/log.c (all MIT) are pulled in by `FetchContent` at configure time
+(SHA-256 pinned; log.c is pinned to commit `f9ea349`). For offline builds pass
+`-DFETCHCONTENT_SOURCE_DIR_GIFLIB=<dir>`,
+`-DFETCHCONTENT_SOURCE_DIR_LUA=<dir>` and
+`-DFETCHCONTENT_SOURCE_DIR_RXILOG=<dir containing src/log.c>`.
 
 From any shell (no VS developer prompt needed):
 
 ```powershell
 cmake --preset release            # Visual Studio generator, x64, into out\
-cmake --build --preset release    # yagp, script_test, gif_dump
+cmake --build --preset release    # yagp, script_test, log_test, gif_dump
 .\out\Release\yagp.exe [file.gif ...]
 ```
 
@@ -86,6 +88,35 @@ python tools/make_icon.py    # needs Pillow; edit RADIUS in the script to change
   `%APPDATA%\YAGP`, the frame cache in `%LOCALAPPDATA%\YAGP` and the startup
   entry; after that nothing is saved until the next launch. Your own `.lua`
   files are never touched.
+- "Enable logging…" asks for a folder and appends to
+  `<folder>\yagp-YYYYMMDD.log`. Clicking "Stop logging" writes a final line and
+  closes the file. The switch and the folder are per run and are never saved;
+  every enable asks again. At midnight (while still enabled) the next lines go
+  to the new date's file in the same folder. One session writes at most 16 MB,
+  after which logging stops and a balloon says so. Log wording is English; file
+  names, paths and script messages keep their UTF-8 bytes.
+
+### Terminal output
+
+```powershell
+.\out\Release\yagp.exe --verbose
+.\out\Release\yagp.exe -v .\example\main.gif
+.\out\Release\yagp.exe --verbose > yagp.log 2> yagp.err
+```
+
+`--verbose`/`-v` mirrors every following log line to the terminal that started
+YAGP. Tray logging does not need to be enabled and no log file is created. The
+line format is the same as the file log (timestamp, level, source, message):
+`TRACE`/`DEBUG`/`INFO` go to stdout, `WARN`/`ERROR`/`FATAL` to stderr.
+Redirected output is UTF-8; a console is written with `WriteConsoleW`.
+
+- Started from Explorer or a shortcut, there is no terminal to attach to: lines
+  only go to DebugView, with no dialog.
+- If YAGP is already running, the new process prints how many paths it forwarded
+  and exits; the running instance's later lines do not appear in that terminal.
+- `--verbose` does not change the tray logging switch or the config; both can be
+  used together. Closing the terminal or Ctrl+C may end the attached process.
+- The `--pick` helper produces no terminal output.
 
 ## Motion scripts
 
@@ -160,6 +191,8 @@ above the primary monitor). Positions refer to the window's top-left corner.
 | `yagp.others()` | Every other GIF: `{ {id, name, x, y, w, h, hx, hy, hw, hh, cx, cy, vx, vy, scripted, paused}, ... }`, including ones without a script and paused ones. `x, y, w, h` is the window, `hx, hy, hw, hh` the visible area, `cx, cy` its centre. `vx`, `vy` are px/s over its last tick, 0 when not moving |
 | `yagp.peer(id)` | One GIF's peer table, or nil |
 | `yagp.overlaps([x, y [, w, h]])` | Other GIFs whose visible area overlaps this GIF's. No arguments: where it is now; x, y: with the window moved there; explicit w, h: that rect at x, y. Sharing an edge is not an overlap |
+| `log.trace(...)`, `log.debug(...)`, `log.info(...)`, `log.warn(...)`, `log.error(...)`, `log.fatal(...)` | Write a log line tagged `script <name>#<id>`. Arguments are converted without metamethods and joined with tabs; long messages keep 1024 bytes and a `...` marker. At most 100 lines per second per script; the excess is dropped and summarised |
+| `yagp.notify(text)`, `yagp.notify(title, text)` | Show a tray balloon (default title `YAGP`). Returns `true` if it was shown, `false` when throttled (at most one per 3 s per script) or unavailable. Values are converted like `log.*`; the tray field limits are applied |
 
 Other GIFs are read-only: a script cannot move them or message them.
 A script sees at most 64 other GIFs.
@@ -208,17 +241,28 @@ end
 - Handlers (`update`, `on_moved`, ...) are looked up as raw fields of `_G`, and
   every call into the script is protected. A strict-mode `_G` metatable works,
   and no script error can take the process down.
-- `print` goes to `OutputDebugString` (view it with DebugView).
+- `print` writes an INFO log line (the same sink as `log.info`), tagged with the
+  GIF's name and script id. Every line also goes to `OutputDebugString`
+  (DebugView), whether or not file logging is enabled.
+- `log.*` never calls `__tostring` and never raises a script error; `print` keeps
+  its old `tostring` formatting for tables and userdata.
 
 ## Design notes
 
 - File dialogs run in a short-lived helper process (`yagp.exe --pick
-  add|replace|script <id>`, or `--pick newscript <id> <preset> <name>`), which
-  sends the chosen path back with `WM_COPYDATA` and exits. In-process, the
+  add|replace|script|logdir <id>`, or `--pick newscript <id> <preset> <name>`),
+  which sends the chosen path back with `WM_COPYDATA` and exits. In-process, the
   dialog loaded about 100 shell DLLs, third-party shell extensions and about 20
   threads, none of which unload, raising the tray from 3 MB to 18 MB private.
   With the helper the tray stays at about 3.5 MB. Results carry a random id, so
   stale or forged messages are ignored.
+- Logging uses rxi/log.c (pinned commit, MIT) for levels, formatting and
+  callbacks, plus a small policy layer (`applog.c`) that owns the date-stamped
+  file, the 16 MB session cap, the day rollover and the `OutputDebugString`
+  mirror. rxi's lock hook is a critical section, so the frame-cache worker and
+  the UI thread cannot interleave a line. The sink escapes CR/LF so one call is
+  always one line and caps a line at 4096 bytes. While logging is off no file is
+  open and no write happens; only the debugger mirror remains.
 - The scale slider is a small self-drawn control, not the comctl32 Trackbar.
 - One D3D11 device and one DirectComposition device are shared by all overlays.
   Each overlay owns only a 2-buffer flip-model composition swap chain.
@@ -317,6 +361,7 @@ After `cmake --build --preset release`:
 python tests/test_gif_stream.py out\Release\gif_dump.exe   # needs Pillow
 python tests/test_frame_cache.py out\Release\gif_dump.exe
 out\Release\script_test.exe
+out\Release\log_test.exe
 ```
 
 The decoder test compares composited frames and delays against Pillow,
@@ -339,7 +384,18 @@ never overlap, without it they pass through, and two GIFs spawned on top of
 each other push apart.
 It also checks that no script can abort or hang the host: strict-mode `_G`,
 a script at its memory cap, non-string errors, backtracking patterns, `__gc`
-finalizers, and a timeout inside a coroutine.
+finalizers, and a timeout inside a coroutine. The `log` table and `yagp.notify`
+are covered too: all six levels, argument conversion, the 1024-byte marker, the
+100-lines-per-second limit and its summary, notification titles/truncation,
+return values and the 3-second throttle.
+
+`log_test` checks the file sink: the `yagp-YYYYMMDD.log` name, append across
+enables, line order and levels, CR/LF escaping and truncation, no writes after
+stop, the 8 KB test cap, a day rollover and multi-threaded line integrity. It
+also checks the `--verbose` terminal mirror: stdout/stderr routing, output while
+file logging is off, and stopping after detach. It writes only into `%TEMP%` (or
+the current directory when a sandbox hides the temp folder) and never touches
+the user's profile.
 
 ## Known limitations
 
@@ -349,3 +405,7 @@ finalizers, and a timeout inside a coroutine.
   ignored and playback loops forever.
 - The UI language is fixed at build time.
 - Built-in preset comments are in Chinese only.
+- Logging is enabled per run from the tray (no level selector, no persisted log
+  path) and its fixed wording is English; paths and messages keep their bytes.
+- Terminal output requires `--verbose`/`-v`; hosts without a console (Explorer,
+  some Git Bash/pty setups) only get redirected handles or DebugView.

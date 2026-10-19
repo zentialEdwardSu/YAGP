@@ -1,4 +1,5 @@
 #include "cursor_hook.h"
+#include "log.h"
 
 #include <string.h>
 
@@ -9,6 +10,7 @@ static HANDLE s_thread;
 static DWORD s_thread_id;
 static HANDLE s_ready;            /* Set once the hook is installed (or failed). */
 static volatile LONG s_installed;
+static DWORD s_hook_error;        /* Set by the hook thread when installation fails. */
 static HWND s_notify;
 static volatile LONG s_want_cursor;
 static volatile LONG s_cursor_pending, s_input_pending;
@@ -123,6 +125,8 @@ static LRESULT CALLBACK hook_proc(int code, WPARAM wp, LPARAM lp)
     return CallNextHookEx(NULL, code, wp, lp); /* Observe only: never swallow input. */
 }
 
+/* Do not call log_* from this thread: it only has a 64 KB stack and formatting
+ * one line uses a few KB. Queue events for the UI thread instead. */
 static DWORD WINAPI hook_thread(void *arg)
 {
     (void)arg;
@@ -131,6 +135,7 @@ static DWORD WINAPI hook_thread(void *arg)
     MSG msg;
     PeekMessageW(&msg, NULL, WM_USER, WM_USER, PM_NOREMOVE); /* Create the queue for WM_QUIT. */
     HHOOK hook = SetWindowsHookExW(WH_MOUSE_LL, hook_proc, GetModuleHandleW(NULL), 0);
+    if (!hook) s_hook_error = GetLastError();
     InterlockedExchange(&s_installed, hook != NULL);
     SetEvent(s_ready);
     if (!hook) return 1;
@@ -157,21 +162,31 @@ static bool start(void)
 {
     if (s_thread) return s_installed != 0;
     if (!s_ready) s_ready = CreateEventW(NULL, FALSE, FALSE, NULL);
-    if (!s_ready) return false;
+    if (!s_ready) {
+        log_warn("cannot create cursor hook event (error %lu); using polling",
+                 (unsigned long)GetLastError());
+        return false;
+    }
     POINT p;
     if (GetCursorPos(&p)) {
         InterlockedExchange(&s_pos_x, p.x);
         InterlockedExchange(&s_pos_y, p.y);
     }
     s_thread = CreateThread(NULL, 64 * 1024, hook_thread, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, &s_thread_id);
-    if (!s_thread) return false;
+    if (!s_thread) {
+        log_warn("cannot start cursor hook thread (error %lu); using polling",
+                 (unsigned long)GetLastError());
+        return false;
+    }
     WaitForSingleObject(s_ready, 2000);
     if (!s_installed) {
         WaitForSingleObject(s_thread, 2000);
         CloseHandle(s_thread);
         s_thread = NULL;
+        log_warn("cursor hook unavailable (error %lu); using polling", (unsigned long)s_hook_error);
         return false;
     }
+    log_debug("cursor hook installed");
     return true;
 }
 

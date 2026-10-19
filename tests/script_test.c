@@ -6,6 +6,7 @@
 #include "input_fsm.h"
 #include "transform.h"
 #include "i18n.h"
+#include "log.h"
 #include "monitors.h"
 #include "script.h"
 
@@ -140,6 +141,52 @@ static double center_dist(const FakeWin *w)
 static int s_failures;
 #define CHECK(cond, ...) do { if (!(cond)) { ++s_failures; printf("FAIL %s:%d: ", __FILE__, __LINE__); \
     printf(__VA_ARGS__); printf("\n"); } } while (0)
+
+/* ---- captured log lines (yagp.log / print / rate-limit summaries) ---------- */
+
+#define LOG_CAP 512
+static struct {
+    int level;
+    char source[160];
+    char text[1200];
+} s_logs[LOG_CAP];
+static int s_logs_n;
+
+static void collect(log_Event *ev)
+{
+    if (s_logs_n >= LOG_CAP) return;
+    s_logs[s_logs_n].level = ev->level;
+    strncpy_s(s_logs[s_logs_n].source, sizeof(s_logs[0].source), ev->file ? ev->file : "", _TRUNCATE);
+    vsnprintf(s_logs[s_logs_n].text, sizeof(s_logs[0].text), ev->fmt, ev->ap);
+    ++s_logs_n;
+}
+
+static void logs_reset(void) { s_logs_n = 0; }
+
+static int logs_count(int level)
+{
+    int n = 0;
+    for (int i = 0; i < s_logs_n; ++i) {
+        if (level < 0 || s_logs[i].level == level) ++n;
+    }
+    return n;
+}
+
+static bool logs_contain(int level, const char *needle)
+{
+    for (int i = 0; i < s_logs_n; ++i) {
+        if ((level < 0 || s_logs[i].level == level) && strstr(s_logs[i].text, needle)) return true;
+    }
+    return false;
+}
+
+static bool logs_source_contains(const char *needle)
+{
+    for (int i = 0; i < s_logs_n; ++i) {
+        if (strstr(s_logs[i].source, needle)) return true;
+    }
+    return false;
+}
 
 /* True if err contains TXT_U8_SCRIPT_TIMEOUT up to its first format specifier,
  * so the check works whatever YAGP_LANG the build uses. */
@@ -1029,6 +1076,10 @@ typedef struct FakeExt {
     double matrix_dur;
     int cursor, draggable, clickthrough;
     double opacity;
+    char notify_title[128];
+    char notify_text[1024];
+    int notify_calls;
+    bool notify_ok;
 } FakeExt;
 static FakeExt s_ext;
 
@@ -1090,10 +1141,18 @@ static void x_set_draggable(void *ctx, bool v) { (void)ctx; s_ext.draggable = v;
 static void x_set_clickthrough(void *ctx, bool v) { (void)ctx; s_ext.clickthrough = v; }
 static void x_subs_changed(void *ctx, unsigned m) { (void)ctx; s_ext.subs = m; s_ext.subs_calls++; }
 static double x_now(void *ctx) { (void)ctx; return s_ext.now; }
+static bool x_notify(void *ctx, const char *title, const char *text)
+{
+    (void)ctx;
+    ++s_ext.notify_calls;
+    strncpy_s(s_ext.notify_title, sizeof(s_ext.notify_title), title ? title : "", _TRUNCATE);
+    strncpy_s(s_ext.notify_text, sizeof(s_ext.notify_text), text ? text : "", _TRUNCATE);
+    return s_ext.notify_ok;
+}
 
 static const ScriptHostExtOps EXT = {x_load_clip, x_unload_clip, x_clip_info, x_play, x_seek, x_get_frame,
                                      x_set_speed, x_set_playing, x_set_matrix, x_set_opacity, x_set_cursor,
-                                     x_set_draggable, x_set_clickthrough, x_subs_changed, x_now};
+                                     x_set_draggable, x_set_clickthrough, x_subs_changed, x_now, x_notify};
 
 static Script *load_ext(FakeWin *w, const char *src, wchar_t *err)
 {
@@ -1531,8 +1590,180 @@ static void test_transform(void)
     }
 }
 
+/* ---- yagp.log / print / yagp.notify --------------------------------------- */
+
+static void test_lua_log(void)
+{
+    wchar_t err[512];
+    FakeWin w = {100, 100, 50, 50, false, 0, 0};
+    w.id = 4;
+    memset(&s_ext, 0, sizeof(s_ext));
+    s_ext.now = 1000.0;
+    logs_reset();
+    Script *s = load_ext(&w,
+        "function run()\n"
+        "  log.trace('t')\n"
+        "  log.debug('d')\n"
+        "  log.info('i', 42, true, nil, {})\n"
+        "  log.warn('w')\n"
+        "  log.error('e')\n"
+        "  log.fatal('f')\n"
+        "  print('printed', 7)\n"
+        "  log.info(string.rep('x', 3000))\n"
+        "  log.info(setmetatable({}, {__tostring = function() error('boom') end}))\n"
+        "  log.info()\n"
+        "end\n", err);
+    CHECK(s, "log load: %ls", err);
+    if (!s) return;
+    CHECK(run_check(s, "run"), "log run");
+    CHECK(logs_contain(LOG_TRACE, "t"), "log.trace");
+    CHECK(logs_contain(LOG_DEBUG, "d"), "log.debug");
+    CHECK(logs_contain(LOG_INFO, "i\t42\ttrue\tnil\ttable"), "log.info conversion");
+    CHECK(logs_contain(LOG_WARN, "w"), "log.warn");
+    CHECK(logs_contain(LOG_ERROR, "e"), "log.error");
+    CHECK(logs_contain(LOG_FATAL, "f"), "log.fatal");
+    CHECK(logs_contain(LOG_INFO, "printed\t7"), "print maps to INFO");
+    CHECK(!logs_contain(LOG_INFO, "userdata:"), "print leaked the Lua buffer placeholder");
+    bool capped = false;
+    for (int i = 0; i < s_logs_n; ++i) {
+        size_t n = strlen(s_logs[i].text);
+        if (s_logs[i].level == LOG_INFO && n == 1023 && strcmp(s_logs[i].text + n - 3, "...") == 0)
+            capped = true;
+    }
+    CHECK(capped, "long log message truncated with a marker");
+    CHECK(logs_contain(LOG_INFO, "table"), "__tostring is not called");
+    CHECK(logs_source_contains("test.gif#4"), "log source tag");
+    script_destroy(s);
+}
+
+static void test_log_rate_limit(void)
+{
+    wchar_t err[512];
+    FakeWin w = {0};
+    w.id = 6;
+    memset(&s_ext, 0, sizeof(s_ext));
+    s_ext.now = 100.0;
+    Script *s = load_ext(&w, "function burst() for i = 1, 150 do log.info('line', i) end end", err);
+    CHECK(s, "burst load: %ls", err);
+    if (!s) return;
+    logs_reset();
+    CHECK(run_check(s, "burst"), "burst run");
+    CHECK(logs_count(LOG_INFO) == 100, "rate limit kept %d lines", logs_count(LOG_INFO));
+    double next = script_next_timer(s);
+    CHECK(next > 100.9 && next < 101.1, "summary timer armed at %.3f", next);
+    s_ext.now = 101.0;
+    CHECK(script_run_timers(s, 101.0, err, 512), "summary flush: %ls", err);
+    CHECK(logs_contain(LOG_WARN, "dropped 50 log line(s)"), "drop summary line");
+    script_destroy(s);
+}
+
+static void test_lua_notify(void)
+{
+    wchar_t err[512];
+    FakeWin w = {0};
+    w.id = 7;
+
+    /* Default title, success and the INFO line. */
+    memset(&s_ext, 0, sizeof(s_ext));
+    s_ext.now = 10.0;
+    s_ext.notify_ok = true;
+    logs_reset();
+    Script *s = load_ext(&w, "r = yagp.notify('hello')", err);
+    CHECK(s, "notify load: %ls", err);
+    if (s) {
+        CHECK(s_ext.notify_calls == 1, "notify calls %d", s_ext.notify_calls);
+        CHECK(strcmp(s_ext.notify_title, "YAGP") == 0, "default title '%s'", s_ext.notify_title);
+        CHECK(strcmp(s_ext.notify_text, "hello") == 0, "notify text '%s'", s_ext.notify_text);
+        CHECK(logs_contain(LOG_INFO, "notify: YAGP | hello"), "notify logged");
+        script_destroy(s);
+    }
+
+    /* Explicit title; a table argument becomes its type name without __tostring. */
+    memset(&s_ext, 0, sizeof(s_ext));
+    s_ext.now = 10.0;
+    s_ext.notify_ok = true;
+    logs_reset();
+    s = load_ext(&w,
+        "r = yagp.notify('Title', setmetatable({}, {__tostring = function() error('boom') end}), 'x')\n",
+        err);
+    CHECK(s, "notify title load: %ls", err);
+    if (s) {
+        CHECK(strcmp(s_ext.notify_title, "Title") == 0, "explicit title '%s'", s_ext.notify_title);
+        CHECK(strcmp(s_ext.notify_text, "table") == 0, "table argument '%s'", s_ext.notify_text);
+        script_destroy(s);
+    }
+
+    /* Long text is bounded before it reaches the tray fields. */
+    memset(&s_ext, 0, sizeof(s_ext));
+    s_ext.now = 10.0;
+    s_ext.notify_ok = true;
+    s = load_ext(&w, "r = yagp.notify('a', string.rep('b', 4000))", err);
+    CHECK(s, "notify long load: %ls", err);
+    if (s) {
+        CHECK(strlen(s_ext.notify_text) <= 1023, "notify text length %zu", strlen(s_ext.notify_text));
+        CHECK(strlen(s_ext.notify_text) >= 1000, "notify text was not truncated");
+        script_destroy(s);
+    }
+
+    /* One balloon per 3 s; the return value reports the suppression. */
+    memset(&s_ext, 0, sizeof(s_ext));
+    s_ext.now = 20.0;
+    s_ext.notify_ok = true;
+    logs_reset();
+    s = load_ext(&w,
+        "r1 = yagp.notify('first')\n"
+        "r2 = yagp.notify('second')\n"
+        "function check() assert(r1 == true and r2 == false, 'return values') end\n", err);
+    CHECK(s, "notify throttle load: %ls", err);
+    if (s) {
+        CHECK(s_ext.notify_calls == 1, "throttled host calls %d", s_ext.notify_calls);
+        CHECK(strcmp(s_ext.notify_text, "first") == 0, "first notification shown");
+        CHECK(run_check(s, "check"), "notify return values");
+        s_ext.now = 23.0;
+        CHECK(script_run_timers(s, 23.0, err, 512), "notify summary flush: %ls", err);
+        CHECK(logs_contain(LOG_WARN, "suppressed 1 notification(s)"), "notify summary line");
+        script_destroy(s);
+    }
+
+    /* A host that cannot show balloons yields false and no INFO line. */
+    memset(&s_ext, 0, sizeof(s_ext));
+    s_ext.now = 100.0;
+    s_ext.notify_ok = false;
+    logs_reset();
+    s = load_ext(&w,
+        "r = yagp.notify('nope')\n"
+        "function check() assert(r == false) end\n", err);
+    CHECK(s, "notify rejected load: %ls", err);
+    if (s) {
+        CHECK(s_ext.notify_calls == 1, "rejected host calls %d", s_ext.notify_calls);
+        CHECK(run_check(s, "check"), "notify returns false when rejected");
+        CHECK(!logs_contain(LOG_INFO, "notify:"), "rejected notify is not logged as shown");
+        script_destroy(s);
+    }
+}
+
+static void test_log_no_ext(void)
+{
+    wchar_t err[512];
+    FakeWin w = {100, 100, 50, 50, false, 0, 0};
+    w.id = 9;
+    logs_reset();
+    const char *src = "function f() log.info('safe') assert(yagp.notify('x') == false) end";
+    Script *s = script_create(&OPS, &w, src, strlen(src), "test.lua", "test.gif", w.id, err, 512);
+    CHECK(s, "no-ext load: %ls", err);
+    if (!s) return;
+    CHECK(run_check(s, "f"), "no-ext run");
+    CHECK(logs_contain(LOG_INFO, "safe"), "no-ext log");
+    script_destroy(s);
+}
+
 int main(void)
 {
+    /* script.c logs through rxi/log.c; capture the lines and keep stderr quiet. */
+    log_set_quiet(true);
+    log_set_level(LOG_TRACE);
+    log_add_callback(collect, NULL, LOG_TRACE);
+
     /* 1920x1080 primary (40 px taskbar) and a 1280x1024 monitor to its right,
      * offset 200 px down: the strip x >= 1920, y < 200 is a gap. */
     Monitor layout[2] = {mon(0, 0, 1920, 1080, 40, true), mon(1920, 200, 1280, 1024, 0, false)};
@@ -1550,6 +1781,10 @@ int main(void)
     test_clip_path();
     test_input_fsm();
     test_transform();
+    test_lua_log();
+    test_log_rate_limit();
+    test_lua_notify();
+    test_log_no_ext();
     if (s_failures) {
         printf("%d check(s) failed\n", s_failures);
         return 1;

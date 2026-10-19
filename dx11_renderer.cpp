@@ -3,7 +3,16 @@
 #include <d3d11.h>
 #include <dxgi1_2.h>
 #include <dcomp.h>
+#include <cstdarg>
+#include <cstdio>
+#include <ctime>
 #include <new>
+
+/* rxi/log.h has no extern "C" guard; the C++ standard headers above already
+ * pulled in the system ones it includes. */
+extern "C" {
+#include "log.h"
+}
 
 template <typename T> static void release(T *&p)
 {
@@ -79,10 +88,22 @@ extern "C" RenderDevice *render_device_create(void)
                 levels + 1, ARRAYSIZE(levels) - 1, D3D11_SDK_VERSION,
                 &dev->device, nullptr, &dev->context);
         }
+        if (FAILED(hr) && drivers[i] == D3D_DRIVER_TYPE_WARP) {
+            log_debug("D3D11 WARP device creation failed (hr=0x%08lX)", (unsigned long)hr);
+        } else if (SUCCEEDED(hr)) {
+            log_debug("using %s D3D11 device",
+                      drivers[i] == D3D_DRIVER_TYPE_WARP ? "WARP" : "hardware");
+        }
     }
-    if (FAILED(hr)) goto fail;
+    if (FAILED(hr)) {
+        log_error("D3D11 device creation failed (hr=0x%08lX)", (unsigned long)hr);
+        goto fail;
+    }
     hr = dev->device->QueryInterface(__uuidof(IDXGIDevice), (void **)&dxgi);
-    if (FAILED(hr)) goto fail;
+    if (FAILED(hr)) {
+        log_error("IDXGIDevice query failed (hr=0x%08lX)", (unsigned long)hr);
+        goto fail;
+    }
     /* Keep at most one queued frame per surface; we never render ahead. */
     {
         IDXGIDevice1 *dxgi1 = nullptr;
@@ -92,11 +113,20 @@ extern "C" RenderDevice *render_device_create(void)
         }
     }
     hr = dxgi->GetAdapter(&adapter);
-    if (FAILED(hr)) goto fail;
+    if (FAILED(hr)) {
+        log_error("DXGI adapter query failed (hr=0x%08lX)", (unsigned long)hr);
+        goto fail;
+    }
     hr = adapter->GetParent(__uuidof(IDXGIFactory2), (void **)&dev->factory);
-    if (FAILED(hr)) goto fail;
+    if (FAILED(hr)) {
+        log_error("DXGI factory query failed (hr=0x%08lX)", (unsigned long)hr);
+        goto fail;
+    }
     hr = DCompositionCreateDevice(dxgi, __uuidof(IDCompositionDevice), (void **)&dev->composition);
-    if (FAILED(hr)) goto fail;
+    if (FAILED(hr)) {
+        log_error("DirectComposition device creation failed (hr=0x%08lX)", (unsigned long)hr);
+        goto fail;
+    }
 
     release(adapter);
     release(dxgi);
@@ -170,6 +200,7 @@ extern "C" RenderSurface *render_surface_create(RenderDevice *dev, HWND hwnd, in
 
 fail:
     note_failure(dev, hr);
+    log_error("overlay surface creation failed (hr=0x%08lX)", (unsigned long)hr);
     render_surface_destroy(s);
     return nullptr;
 }

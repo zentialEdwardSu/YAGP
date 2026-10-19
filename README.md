@@ -10,13 +10,13 @@ YAGP把 GIF 动画显示成无边框、背景透明的桌面挂件，不占任�
 
 ## 编译
 
-需要 Windows 10/11、Visual Studio 2022 及以上（MSVC）、CMake 3.25 及以上。giflib 5.2.2 和 Lua 5.4.7（均为 MIT 许可）在配置阶段通过 `FetchContent` 下载，并校验 SHA-256。离线编译时传入 `-DFETCHCONTENT_SOURCE_DIR_GIFLIB=<目录>` 和 `-DFETCHCONTENT_SOURCE_DIR_LUA=<目录>`。
+需要 Windows 10/11、Visual Studio 2022 及以上（MSVC）、CMake 3.25 及以上。giflib 5.2.2、Lua 5.4.7 和 rxi/log.c（均为 MIT 许可）在配置阶段通过 `FetchContent` 下载，并校验 SHA-256（log.c 固定到提交 `f9ea349`）。离线编译时传入 `-DFETCHCONTENT_SOURCE_DIR_GIFLIB=<目录>`、`-DFETCHCONTENT_SOURCE_DIR_LUA=<目录>` 和 `-DFETCHCONTENT_SOURCE_DIR_RXILOG=<含 src/log.c 的目录>`。
 
 在任意终端里执行即可，不需要 VS 开发者终端：
 
 ```powershell
 cmake --preset release            # Visual Studio 生成器，x64，输出到 out\
-cmake --build --preset release    # 编译 yagp、script_test、gif_dump
+cmake --build --preset release    # 编译 yagp、script_test、log_test、gif_dump
 .\out\Release\yagp.exe [file.gif ...]
 ```
 
@@ -52,6 +52,22 @@ python tools/make_icon.py    # 需要 Pillow；改脚本里的 RADIUS 可调整�
 - 再次运行 `yagp.exe file.gif` 会把文件添加到已经在运行的实例中。
 - "开机自启动"会写入 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\YAGP`（仅当前用户，不需要管理员权限）。只有当这一项指向当前运行的 exe 时才显示为勾选。开机启动时不弹通知。
 - 状态保存在 `%APPDATA%\YAGP\config.txt`（1 秒防抖，退出时也会保存），包括每个 GIF 绑定的脚本。"删除配置数据"会删除 `%APPDATA%\YAGP`、`%LOCALAPPDATA%\YAGP` 中的帧缓存和开机自启动项，之后直到下次启动都不再保存。你自己的 `.lua` 文件不会被删除。
+- "启用日志记录…"会让你选一个文件夹，日志追加到 `<文件夹>\yagp-YYYYMMDD.log`。再次点击"停止日志记录"会写入最后一行并关闭文件。开关和文件夹都只在本次运行有效，不会保存，每次启用都要重新选择。启用期间跨过午夜时，后续日志写入同一文件夹下新日期的文件。每次启用最多写 16 MB，达到后自动停止并弹出托盘通知。日志措辞固定为英文；文件名、路径和脚本消息按原样以 UTF-8 字节保存。
+
+### 从终端运行
+
+```powershell
+.\out\Release\yagp.exe --verbose
+.\out\Release\yagp.exe -v .\example\main.gif
+.\out\Release\yagp.exe --verbose > yagp.log 2> yagp.err
+```
+
+`--verbose`/`-v` 会把之后所有日志行同时写到启动它的终端；不需要在托盘里启用日志记录，也不会创建日志文件。行格式与文件日志一致（时间戳、级别、来源、消息）：`TRACE`/`DEBUG`/`INFO` 走 stdout，`WARN`/`ERROR`/`FATAL` 走 stderr。重定向到文件或管道时写入 UTF-8 行；直接写控制台时使用 `WriteConsoleW`。
+
+- 从资源管理器或快捷方式带 `--verbose` 启动时没有可附着的终端，只会写 DebugView，不弹窗。
+- 已经有 YAGP 在运行时，新进程只打印转发的路径数量并退出；运行中实例的后续日志不会出现在这个终端里。
+- `--verbose` 不改变托盘日志开关和配置；两者可以同时使用。关闭终端或按 Ctrl+C 可能结束这个附着进程。
+- `--pick` 辅助进程不产生终端日志。
 
 ## 运动脚本
 
@@ -112,6 +128,8 @@ python tools/make_icon.py    # 需要 Pillow；改脚本里的 RADIUS 可调整�
 | `yagp.others()` | 其他所有 GIF：`{ {id, name, x, y, w, h, hx, hy, hw, hh, cx, cy, vx, vy, scripted, paused}, ... }`，包括没有脚本和已暂停的。`x, y, w, h` 是窗口，`hx, hy, hw, hh` 是可见区域，`cx, cy` 是可见区域的中心。`vx`、`vy` 是上一次 tick 的速度（像素/秒），不在运动时为 0 |
 | `yagp.peer(id)` | 某一个 GIF 的信息表，不存在时为 nil |
 | `yagp.overlaps([x, y [, w, h]])` | 可见区域与自己重叠的其他 GIF 列表。不传参数时按当前位置算，传 x、y 时按窗口移到那里算，显式传 w、h 时用 x、y 处的这个矩形。只是边贴着边不算重叠 |
+| `log.trace(...)`、`log.debug(...)`、`log.info(...)`、`log.warn(...)`、`log.error(...)`、`log.fatal(...)` | 写一行带 `script <名称>#<id>` 标识的日志。参数不调用元方法，用制表符连接；超长消息保留 1024 字节并追加 `...`。每个脚本每秒最多 100 行，超出部分丢弃并汇总 |
+| `yagp.notify(text)`、`yagp.notify(title, text)` | 显示托盘气泡（标题默认 `YAGP`）。显示成功返回 `true`；因频率限制（每个脚本 3 秒一次）或宿主不可用而抑制时返回 `false`。参数转换规则同 `log.*`，并按托盘字段截断 |
 
 其他 GIF 的信息是只读的，脚本不能移动别的 GIF，也不能给它们发消息。最多能看到 64 个其他 GIF。
 
@@ -140,11 +158,13 @@ end
 - 模式匹配（`string.find`/`match`/`gmatch`/`gsub`）在 C 里执行，指令数限制打断不了它，所以它有自己的工作量上限（每次调用约 2000 万步，见 `cmake/patch_lstrlib.cmake`）。回溯爆炸的模式会报 "pattern too complex"，而不是卡死。
 - `setmetatable` 拒绝带 `__gc` 的元表：Lua 执行终结器时会关闭钩子，死循环的终结器无法被终止。
 - 事件函数（`update`、`on_moved` 等）按 `_G` 的原始字段查找，每次调用脚本都在保护模式下进行。严格模式的 `_G` 元表可以正常使用，任何脚本错误都不会让进程崩溃。
-- `print` 输出到 `OutputDebugString`，可以用 DebugView 查看。
+- `print` 写一行 INFO 日志（和 `log.info` 用同一个输出通道），带上 GIF 文件名和脚本 id。无论是否启用文件日志，所有行也会输出到 `OutputDebugString`（可用 DebugView 查看）。
+- `log.*` 不调用 `__tostring`，也不会抛出脚本错误；`print` 对其参数仍保留原来的 `tostring` 行为。
 
 ## 设计说明
 
-- 文件对话框在一个短命的辅助进程里运行（`yagp.exe --pick add|replace|script <id>`，或 `--pick newscript <id> <预设> <文件名>`）。它用 `WM_COPYDATA` 把选中的路径发回后退出。如果在主进程里打开对话框，会加载约 100 个 shell DLL、第三方 shell 扩展和约 20 个线程，而且都不会卸载，托盘进程的私有内存会从 3 MB 涨到 18 MB。用辅助进程后托盘保持在约 3.5 MB。结果带有随机 id，过期或伪造的消息会被忽略。
+- 文件对话框在一个短命的辅助进程里运行（`yagp.exe --pick add|replace|script|logdir <id>`，或 `--pick newscript <id> <预设> <文件名>`）。它用 `WM_COPYDATA` 把选中的路径发回后退出。如果在主进程里打开对话框，会加载约 100 个 shell DLL、第三方 shell 扩展和约 20 个线程，而且都不会卸载，托盘进程的私有内存会从 3 MB 涨到 18 MB。用辅助进程后托盘保持在约 3.5 MB。结果带有随机 id，过期或伪造的消息会被忽略。
+- 日志用 rxi/log.c（固定提交，MIT）提供级别、格式化和回调，再由一个小的策略层（`applog.c`）负责按日期命名的文件、16 MB 会话上限、跨日切换和 `OutputDebugString` 镜像。rxi 的锁钩子是一把临界区，所以帧缓存工作线程和 UI 线程不会写出交错的行。输出回调把 CR/LF 转义，保证一次调用只产生一行，并把单行限制在 4096 字节。日志关闭时不打开文件、不写盘，只有调试器镜像还在。
 - 缩放滑块是自绘的小控件，没用 comctl32 的 Trackbar。
 - 所有挂件共用一个 D3D11 设备和一个 DirectComposition 设备，每个挂件只占一个双缓冲的 flip 模型合成交换链。
 - D3D11 设备优先在 WARP（软件光栅器）上创建，失败才用硬件。GPU 在这里不做任何工作：帧在 CPU 上合成并拷进后缓冲区，合成和缩放由 DWM 完成。加载硬件的用户态驱动每个进程要多占 20–60 MB 私有内存（在 AMD 上测得），WARP 只要约 1 MB。交换链缓冲区照样作为普通合成表面交给 DWM。
@@ -195,6 +215,7 @@ end
 python tests/test_gif_stream.py out\Release\gif_dump.exe   # 需要 Pillow
 python tests/test_frame_cache.py out\Release\gif_dump.exe
 out\Release\script_test.exe
+out\Release\log_test.exe
 ```
 
 解码测试把合成后的帧和帧延时与 Pillow 的结果对比，覆盖 disposal 1/2/3、隔行扫描、用 `gif_stream_restart` 循环、色键，以及拒绝格式错误的十六进制颜色。它还会把每个用例解码到缩小的画布（一半、五分之一、奇数尺寸 37×29、1×1），与原尺寸参考帧按"取中心最近像素"采样的结果逐像素对比。
@@ -210,6 +231,9 @@ out\Release\script_test.exe
 - GIF 之间的接触：开始和结束事件（边贴边不算、被删除的 GIF 会结束接触、回调顺序确定），以及 `others`/`peer`/`overlaps` 接口。
 - 两个反弹 GIF 加一个静止障碍物跑 10 万个 tick：开启 `COLLIDE` 时从不重叠，关闭时会互相穿过；两个叠在一起生成的 GIF 会自动分开。
 - 任何脚本都不能让宿主崩溃或卡死：严格模式的 `_G`、内存用满的脚本、非字符串错误、回溯爆炸的模式、`__gc` 终结器、协程内超时。
+- `log` 表和 `yagp.notify` 也覆盖到了：六个级别、参数转换、1024 字节截断标记、每秒 100 行的限流与摘要、通知标题/截断/返回值以及 3 秒节流。
+
+`log_test` 检查文件输出：`yagp-YYYYMMDD.log` 文件名、多次启用的追加语义、行顺序与级别、CR/LF 转义与截断、停止后不再写入、8 KB 测试上限、跨日切换和多线程整行完整性。它还检查 `--verbose` 的终端镜像：stdout/stderr 分流、文件日志关闭时仍输出、detach 后停止。它只写 `%TEMP%`（沙箱隐藏临时目录时退回当前目录），不碰用户配置。
 
 ## 已知限制
 
@@ -217,3 +241,5 @@ out\Release\script_test.exe
 - 0 或 1 厘秒的帧延时按 100 ms 播放，和浏览器一致。GIF 的循环次数被忽略，始终无限循环。
 - 界面语言只能在编译时选定。
 - 内置预设里的注释只有中文。
+- 日志只能在每次运行时从托盘启用（没有级别选择，也不保存日志路径），固定措辞为英文；路径和消息保留原始字节。
+- 终端日志只在带 `--verbose`/`-v` 启动时输出；没有控制台宿主（资源管理器、部分 Git Bash/pty）时只能靠重定向句柄或 DebugView。

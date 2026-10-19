@@ -1,9 +1,11 @@
 #include "overlay.h"
 #include "app.h"
+#include "applog.h"
 #include "clip_path.h"
 #include "contacts.h"
 #include "cursor_hook.h"
 #include "i18n.h"
+#include "log.h"
 #include "monitors.h"
 
 #include <math.h>
@@ -474,6 +476,19 @@ static char *to_utf8(const wchar_t *w)
     char *u = n > 0 ? (char *)malloc((size_t)n) : NULL;
     if (u && WideCharToMultiByte(CP_UTF8, 0, w, -1, u, n, NULL, NULL) <= 0) u[0] = 0;
     return u;
+}
+
+/* UTF-8 -> wide, truncated to cap-1 characters. False when unusable. */
+static bool to_wide(const char *u8, wchar_t *out, size_t cap)
+{
+    if (!out || cap == 0) return false;
+    out[0] = 0;
+    if (!u8 || !*u8) return true;
+    wchar_t tmp[1024];
+    int n = MultiByteToWideChar(CP_UTF8, 0, u8, -1, tmp, ARRAYSIZE(tmp));
+    if (n <= 0) return false;
+    wcsncpy_s(out, cap, tmp, _TRUNCATE);
+    return true;
 }
 
 /* Reads a .lua file (UTF-8, optional BOM). Caller frees *out. */
@@ -950,6 +965,15 @@ static void xhost_subs_changed(void *ctx, unsigned mask)
     if (changed) overlay_refresh_hook(); /* Only bookkeeping: no call back into the script. */
 }
 
+static bool xhost_notify(void *ctx, const char *title, const char *text)
+{
+    (void)ctx;
+    wchar_t wt[64], wm[256];
+    if (!to_wide(title, wt, ARRAYSIZE(wt))) wt[0] = 0;
+    if (!to_wide(text, wm, ARRAYSIZE(wm))) wm[0] = 0;
+    return app_notify(wt, wm);
+}
+
 static double xhost_now(void *ctx)
 {
     (void)ctx;
@@ -959,7 +983,7 @@ static double xhost_now(void *ctx)
 static const ScriptHostExtOps HOST_EXT = {
     xhost_load_clip, xhost_unload_clip, xhost_clip_info, xhost_play, xhost_seek, xhost_get_frame,
     xhost_set_speed, xhost_set_playing, xhost_set_matrix, xhost_set_opacity, xhost_set_cursor,
-    xhost_set_draggable, xhost_set_clickthrough, xhost_subs_changed, xhost_now,
+    xhost_set_draggable, xhost_set_clickthrough, xhost_subs_changed, xhost_now, xhost_notify,
 };
 
 /* ---- script lifecycle and calls -------------------------------------------- */
@@ -1036,7 +1060,11 @@ static void script_fail(Overlay *o, const wchar_t *err)
     overlay_refresh_hook();
     wchar_t title[64];
     _snwprintf_s(title, 64, _TRUNCATE, TXT_SCRIPT_STOPPED_TITLE, overlay_name(o));
-    app_notify(title, err && *err ? err : TXT_UNKNOWN_ERROR);
+    char *u8 = to_utf8(err && *err ? err : TXT_UNKNOWN_ERROR);
+    log_error("script #%d stopped: %s", o->id, u8 ? u8 : "unknown error");
+    free(u8);
+    if (app_notify(title, err && *err ? err : TXT_UNKNOWN_ERROR))
+        log_info("GIF #%d: script error notification shown", o->id);
 }
 
 /* After any call into the script: its earliest timer may have changed. */
@@ -1133,6 +1161,8 @@ void overlay_set_script(Overlay *o, const wchar_t *spec)
     } else {
         o->subs = script_subscriptions(o->script);
         refresh_timer(o);
+        char u8[MAX_PATH * 4];
+        log_info("script #%d loaded: %s", o->id, applog_u8(o->script_spec, u8, sizeof(u8)));
     }
     overlay_refresh_hook();
     app_reschedule();
@@ -1210,6 +1240,9 @@ void overlay_screens_changed(Overlay *o)
 void overlay_set_hidden(Overlay *o, bool hidden)
 {
     if (o->hidden == hidden) return;
+    char u8[MAX_PATH * 4];
+    log_info("GIF #%d %s: %s", o->id, hidden ? "hidden" : "shown",
+             applog_u8(overlay_name(o), u8, sizeof(u8)));
     if (hidden) overlay_announce(o, false);
     o->hidden = hidden;
     if (hidden) {
@@ -1858,7 +1891,11 @@ static void init_defaults(Overlay *o)
 Overlay *overlay_create(const OverlayConfig *cfg, bool use_position, int cascade)
 {
     Overlay *o = (Overlay *)calloc(1, sizeof(Overlay));
-    if (!o) return NULL;
+    if (!o) {
+        log_error("cannot allocate an overlay");
+        return NULL;
+    }
+    const char *stage = "out of memory";
     init_defaults(o);
     o->id = g_app.next_overlay_id++;
     o->scale_pct = valid_scale(cfg->scale_pct);
@@ -1875,6 +1912,7 @@ Overlay *overlay_create(const OverlayConfig *cfg, bool use_position, int cascade
     if (!o->path) goto fail;
     o->name_u8 = to_utf8(overlay_name(o));
     ClipKey key = overlay_key(o);
+    stage = "cannot open GIF";
     if (!clip_open(&o->clips[0], "main", o->path, &key, o->scale_pct, false)) goto fail;
     o->clip_count = 1;
 
@@ -1885,6 +1923,7 @@ Overlay *overlay_create(const OverlayConfig *cfg, bool use_position, int cascade
     SIZE s = scaled_size(o);
     o->aabb[2] = s.cx;
     o->aabb[3] = s.cy;
+    stage = "cannot create the overlay window";
     o->hwnd = CreateWindowExW(ex, OVERLAY_CLASS, overlay_name(o), WS_POPUP,
                               cfg->x, cfg->y, s.cx, s.cy, NULL, NULL, g_app.instance, o);
     if (!o->hwnd) goto fail;
@@ -1894,19 +1933,35 @@ Overlay *overlay_create(const OverlayConfig *cfg, bool use_position, int cascade
     RECT r = {cfg->x, cfg->y, cfg->x + s.cx, cfg->y + s.cy};
     if (!use_position || !MonitorFromRect(&r, MONITOR_DEFAULTTONULL)) center_on_primary(o, cascade);
     if (o->clickthrough) apply_ex_style(o);
+    stage = "cannot create the swap chain";
     if (!overlay_attach_surface(o)) goto fail;
     reset_timing(o);
     sync_pos(o);
     if (o->hidden) clip_park(&o->clips[0]); /* Restored hidden: no canvas until shown. */
     else ShowWindow(o->hwnd, SW_SHOWNOACTIVATE);
     /* A custom script that has gone missing is dropped silently on restore. */
-    if (cfg->script && *cfg->script &&
-        (find_builtin(cfg->script) || GetFileAttributesW(cfg->script) != INVALID_FILE_ATTRIBUTES)) {
-        overlay_set_script(o, cfg->script);
+    if (cfg->script && *cfg->script) {
+        if (find_builtin(cfg->script) || GetFileAttributesW(cfg->script) != INVALID_FILE_ATTRIBUTES) {
+            overlay_set_script(o, cfg->script);
+        } else {
+            char spec_u8[MAX_PATH * 4];
+            log_warn("skipping missing script for GIF #%d: %s", o->id,
+                     applog_u8(cfg->script, spec_u8, sizeof(spec_u8)));
+        }
+    }
+    {
+        char u8[MAX_PATH * 4];
+        log_info("created GIF #%d: %s (%dx%d, %d frame(s), scale %d%%)", o->id,
+                 applog_u8(o->path, u8, sizeof(u8)), o->clips[0].gif->width, o->clips[0].gif->height,
+                 o->clips[0].frame_count, o->scale_pct);
     }
     return o;
 
 fail:
+    {
+        char u8[MAX_PATH * 4];
+        log_error("cannot create overlay for %s: %s", applog_u8(cfg->path, u8, sizeof(u8)), stage);
+    }
     overlay_destroy(o);
     return NULL;
 }
@@ -1954,8 +2009,10 @@ void overlay_replace(Overlay *o, const wchar_t *path)
     Clip c;
     ClipKey key = overlay_key(o);
     wchar_t *p = dup_wcs(path);
+    char u8[MAX_PATH * 4];
     if (!p || !clip_open(&c, "main", path, &key, o->scale_pct, o->hidden)) {
         free(p);
+        log_error("cannot replace GIF: %s", applog_u8(path, u8, sizeof(u8)));
         app_error(TXT_ERR_OPEN_GIF, path);
         return;
     }
@@ -1965,6 +2022,7 @@ void overlay_replace(Overlay *o, const wchar_t *path)
     if (o->surface && !render_surface_resize(o->surface, c.gif->out_w, c.gif->out_h)) {
         clip_close(&c);
         free(p);
+        log_error("cannot resize swap chain for GIF #%d: %s", o->id, applog_u8(path, u8, sizeof(u8)));
         app_error(TXT_ERR_SWAPCHAIN, path);
         return;
     }
@@ -1994,6 +2052,7 @@ void overlay_replace(Overlay *o, const wchar_t *path)
         if (spec) overlay_set_script(o, spec);
         free(spec);
     }
+    log_info("replaced GIF #%d: %s", o->id, applog_u8(o->path, u8, sizeof(u8)));
     deliver_plain(o, SEV_MOVED); /* Size changed. */
 }
 
@@ -2096,7 +2155,10 @@ void overlay_command(Overlay *o, UINT cmd)
         o->ct_override = -1; /* The user's choice wins over a script's. */
         apply_ex_style(o);
         overlay_refresh_hook();
-        if (o->clickthrough) app_notify(TXT_CLICKTHROUGH_ON_TITLE, TXT_CLICKTHROUGH_ON_TEXT);
+        if (o->clickthrough) {
+            log_info("GIF #%d: click-through enabled", o->id);
+            app_notify(TXT_CLICKTHROUGH_ON_TITLE, TXT_CLICKTHROUGH_ON_TEXT);
+        }
         break;
     case OVERLAY_CMD_HIDE:
         overlay_set_hidden(o, !o->hidden);

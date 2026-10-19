@@ -72,9 +72,22 @@ target_include_directories(lua PUBLIC ${LUA_DIR})
 target_compile_definitions(lua PRIVATE _CRT_SECURE_NO_WARNINGS)
 target_compile_options(lua PRIVATE /W0)
 
+# rxi/log.c (MIT): small logging core used by the app and the Lua host. The
+# commit is pinned and the archive hash verified. Offline:
+# -DFETCHCONTENT_SOURCE_DIR_RXILOG=<dir containing src/log.c>.
+FetchContent_Declare(rxilog
+    URL "https://github.com/rxi/log.c/archive/f9ea34994bd58ed342d2245cd4110bb5c6790153.tar.gz"
+    URL_HASH SHA256=0e1b70940986c16a8cb7ca322680b3c7614f769bc477c5b90e68a42aecc77ff6
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+FetchContent_MakeAvailable(rxilog)
+add_library(rxilog STATIC ${rxilog_SOURCE_DIR}/src/log.c)
+target_include_directories(rxilog PUBLIC ${rxilog_SOURCE_DIR}/src)
+target_compile_definitions(rxilog PRIVATE _CRT_SECURE_NO_WARNINGS)
+target_compile_options(rxilog PRIVATE /W0)
+
 add_executable(yagp WIN32
     main.c overlay.c clip.c clip_path.c config.c cursor_hook.c dialogs.c gif_stream.c frame_cache.c
-    dx11_renderer.cpp input_fsm.c monitors.c script.c contacts.c transform.c presets.rc app.manifest)
+    applog.c dx11_renderer.cpp input_fsm.c monitors.c script.c contacts.c transform.c presets.rc app.manifest)
 # UI language for i18n.h: zh_CN (default) or en.
 set(YAGP_LANG "zh_CN" CACHE STRING "UI language (zh_CN, en)")
 set_property(CACHE YAGP_LANG PROPERTY STRINGS zh_CN en)
@@ -88,7 +101,7 @@ endif()
 
 target_compile_definitions(yagp PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX
     _WIN32_WINNT=0x0A00 WINVER=0x0A00 ${YAGP_LANG_DEFINE})
-target_link_libraries(yagp PRIVATE giflib lua
+target_link_libraries(yagp PRIVATE giflib lua rxilog
     user32 gdi32 shell32 shcore comdlg32 ole32 advapi32 d3d11 dxgi dcomp)
 target_compile_options(yagp PRIVATE /W4 /utf-8 /GS /guard:cf
     $<$<COMPILE_LANGUAGE:CXX>:/GR->)
@@ -109,4 +122,13 @@ target_include_directories(script_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_definitions(script_test PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS
     YAGP_SCRIPT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/scripts" ${YAGP_LANG_DEFINE})
 target_compile_options(script_test PRIVATE /W4 /utf-8)
-target_link_libraries(script_test PRIVATE lua user32 shcore)
+target_link_libraries(script_test PRIVATE lua rxilog user32 shcore)
+
+# File-output regression test for applog.c: build/log_test.exe. The smaller cap
+# lets the test reach the session limit without writing 16 MB.
+add_executable(log_test EXCLUDE_FROM_ALL tests/log_test.c applog.c)
+target_include_directories(log_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(log_test PRIVATE _CRT_SECURE_NO_WARNINGS YAGP_APPLOG_TEST
+    YAGP_APPLOG_LIMIT=8192)
+target_compile_options(log_test PRIVATE /W4 /utf-8)
+target_link_libraries(log_test PRIVATE rxilog)

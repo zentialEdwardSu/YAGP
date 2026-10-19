@@ -1,4 +1,5 @@
 #include "config.h"
+#include "log.h"
 
 #include <windows.h>
 #include <shlobj.h>
@@ -74,20 +75,48 @@ static void parse_line(wchar_t *line, ConfigEntryFn fn, void *ctx)
 void config_load(ConfigEntryFn fn, void *ctx)
 {
     wchar_t path[MAX_PATH];
-    if (!config_file(path, MAX_PATH, L"config.txt")) return;
+    if (!config_file(path, MAX_PATH, L"config.txt")) {
+        log_error("cannot resolve the settings folder");
+        return;
+    }
     HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-    if (f == INVALID_HANDLE_VALUE) return;
+    if (f == INVALID_HANDLE_VALUE) {
+        DWORD err = GetLastError();
+        if (err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND)
+            log_warn("cannot open config (error %lu)", (unsigned long)err);
+        return;
+    }
     LARGE_INTEGER size;
     char *utf8 = NULL;
     wchar_t *text = NULL;
     DWORD got = 0;
-    if (!GetFileSizeEx(f, &size) || size.QuadPart <= 0 || size.QuadPart > 4 * 1024 * 1024) goto done;
+    if (!GetFileSizeEx(f, &size)) {
+        log_warn("cannot stat config (error %lu)", (unsigned long)GetLastError());
+        goto done;
+    }
+    if (size.QuadPart <= 0 || size.QuadPart > 4 * 1024 * 1024) {
+        log_warn("config size out of range: %lld byte(s)", (long long)size.QuadPart);
+        goto done;
+    }
     utf8 = (char *)malloc((size_t)size.QuadPart);
-    if (!utf8 || !ReadFile(f, utf8, (DWORD)size.QuadPart, &got, NULL)) goto done;
+    if (!utf8) {
+        log_error("out of memory reading config");
+        goto done;
+    }
+    if (!ReadFile(f, utf8, (DWORD)size.QuadPart, &got, NULL)) {
+        log_warn("cannot read config (error %lu)", (unsigned long)GetLastError());
+        goto done;
+    }
     int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8, (int)got, NULL, 0);
-    if (wlen <= 0) goto done;
+    if (wlen <= 0) {
+        log_warn("config is not valid UTF-8");
+        goto done;
+    }
     text = (wchar_t *)malloc(((size_t)wlen + 1) * sizeof(wchar_t));
-    if (!text) goto done;
+    if (!text) {
+        log_error("out of memory reading config");
+        goto done;
+    }
     MultiByteToWideChar(CP_UTF8, 0, utf8, (int)got, text, wlen);
     text[wlen] = 0;
 
@@ -108,18 +137,34 @@ done:
 static bool write_all(HANDLE f, const char *data, size_t n)
 {
     DWORD wrote = 0;
-    return WriteFile(f, data, (DWORD)n, &wrote, NULL) && wrote == (DWORD)n;
+    if (!WriteFile(f, data, (DWORD)n, &wrote, NULL)) return false;
+    if (wrote != (DWORD)n) {
+        SetLastError(ERROR_WRITE_FAULT); /* Short write with a successful API call. */
+        return false;
+    }
+    return true;
 }
 
 bool config_save(const OverlayConfig *entries, int count)
 {
     wchar_t dir[MAX_PATH], tmp[MAX_PATH], dst[MAX_PATH];
-    if (!config_dir(dir, MAX_PATH)) return false;
-    CreateDirectoryW(dir, NULL);
-    if (!config_file(tmp, MAX_PATH, L"config.tmp") || !config_file(dst, MAX_PATH, L"config.txt")) return false;
+    if (!config_dir(dir, MAX_PATH)) {
+        log_error("cannot resolve the settings folder");
+        return false;
+    }
+    if (!CreateDirectoryW(dir, NULL) && GetLastError() != ERROR_ALREADY_EXISTS)
+        log_warn("cannot create settings folder (error %lu)", (unsigned long)GetLastError());
+    if (!config_file(tmp, MAX_PATH, L"config.tmp") || !config_file(dst, MAX_PATH, L"config.txt")) {
+        log_error("cannot build the config path");
+        return false;
+    }
 
     HANDLE f = CreateFileW(tmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (f == INVALID_HANDLE_VALUE) return false;
+    if (f == INVALID_HANDLE_VALUE) {
+        log_error("cannot open config for writing (error %lu)", (unsigned long)GetLastError());
+        return false;
+    }
+    SetLastError(ERROR_SUCCESS);
     bool ok = write_all(f, CONFIG_HEADER, sizeof(CONFIG_HEADER) - 1);
     for (int i = 0; ok && i < count; ++i) {
         const OverlayConfig *e = &entries[i];
@@ -143,8 +188,16 @@ bool config_save(const OverlayConfig *entries, int count)
         ok = ok && write_all(f, "\n", 1);
     }
     ok = ok && FlushFileBuffers(f);
+    DWORD write_error = ok ? 0 : GetLastError();
+    if (!ok && write_error == ERROR_SUCCESS) write_error = ERROR_WRITE_FAULT;
     CloseHandle(f);
-    if (!ok || !MoveFileExW(tmp, dst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    if (!ok) {
+        log_error("cannot write config (error %lu)", (unsigned long)write_error);
+        DeleteFileW(tmp);
+        return false;
+    }
+    if (!MoveFileExW(tmp, dst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        log_error("cannot replace config (error %lu)", (unsigned long)GetLastError());
         DeleteFileW(tmp);
         return false;
     }
@@ -154,7 +207,10 @@ bool config_save(const OverlayConfig *entries, int count)
 bool config_delete_all(void)
 {
     wchar_t dir[MAX_PATH + 1];
-    if (!config_dir(dir, MAX_PATH)) return false;
+    if (!config_dir(dir, MAX_PATH)) {
+        log_error("cannot resolve the settings folder");
+        return false;
+    }
     if (GetFileAttributesW(dir) == INVALID_FILE_ATTRIBUTES) return true;
     size_t n = wcslen(dir);
     dir[n + 1] = 0; /* SHFileOperation wants a double-NUL terminated list. */
@@ -163,5 +219,7 @@ bool config_delete_all(void)
     op.wFunc = FO_DELETE;
     op.pFrom = dir;
     op.fFlags = FOF_NO_UI;
-    return SHFileOperationW(&op) == 0 && !op.fAnyOperationsAborted;
+    bool ok = SHFileOperationW(&op) == 0 && !op.fAnyOperationsAborted;
+    if (!ok) log_error("cannot delete settings folder");
+    return ok;
 }

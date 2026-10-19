@@ -1,5 +1,7 @@
 #include "clip.h"
 #include "app.h"
+#include "applog.h"
+#include "log.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -87,7 +89,10 @@ static bool submit_job(CacheJob *j)
 {
     if (!s_worker) {
         s_worker = CreateThread(NULL, 0, cache_worker, NULL, 0, NULL);
-        if (!s_worker) return false;
+        if (!s_worker) {
+            log_warn("cannot start cache worker (error %lu)", (unsigned long)GetLastError());
+            return false;
+        }
     }
     AcquireSRWLockExclusive(&s_job_lock);
     if (s_job_tail) s_job_tail->next = j;
@@ -141,6 +146,8 @@ static void load_cache(Clip *c, const ClipKey *k)
                          g_app.cache_dir, &fc)) {
         adopt(c, &fc);
         frame_cache_free(&fc);
+        char u8[MAX_PATH * 4];
+        log_debug("cache hit: %s", applog_u8(c->path, u8, sizeof(u8)));
         return;
     }
     CacheJob *j = (CacheJob *)calloc(1, sizeof(CacheJob));
@@ -152,6 +159,8 @@ static void load_cache(Clip *c, const ClipKey *k)
         wcsncpy_s(j->dir, MAX_PATH, g_app.cache_dir, _TRUNCATE);
         if (j->path && submit_job(j)) {
             c->job = j;
+            char u8[MAX_PATH * 4];
+            log_debug("cache miss, building: %s", applog_u8(c->path, u8, sizeof(u8)));
             return;
         }
         clip_job_done(j);
@@ -161,6 +170,11 @@ static void load_cache(Clip *c, const ClipKey *k)
                         g_app.cache_dir, &fc)) {
         adopt(c, &fc);
         frame_cache_free(&fc);
+        char u8[MAX_PATH * 4];
+        log_debug("cache built inline: %s", applog_u8(c->path, u8, sizeof(u8)));
+    } else {
+        char u8[MAX_PATH * 4];
+        log_warn("cache build failed: %s", applog_u8(c->path, u8, sizeof(u8)));
     }
 }
 
@@ -169,7 +183,14 @@ bool clip_cache_ready(Clip *c, void *job)
     CacheJob *j = (CacheJob *)job;
     if (!c->gif || c->job != j) return false;
     c->job = NULL;
-    if (j->ok && j->cache.width == c->gif->width && j->cache.height == c->gif->height) adopt(c, &j->cache);
+    char u8[MAX_PATH * 4];
+    if (j->ok && j->cache.width == c->gif->width && j->cache.height == c->gif->height) {
+        adopt(c, &j->cache);
+        log_debug("cache ready: %s (%d frame(s))", applog_u8(j->path, u8, sizeof(u8)),
+                  j->cache.frame_count);
+    } else {
+        log_warn("cache build failed: %s", applog_u8(j->path, u8, sizeof(u8)));
+    }
     return true;
 }
 
