@@ -243,3 +243,19 @@ out\Release\log_test.exe
 - 内置预设里的注释只有中文。
 - 日志只能在每次运行时从托盘启用（没有级别选择，也不保存日志路径），固定措辞为英文；路径和消息保留原始字节。
 - 终端日志只在带 `--verbose`/`-v` 启动时输出；没有控制台宿主（资源管理器、部分 Git Bash/pty）时只能靠重定向句柄或 DebugView。
+
+## 许可
+
+YAGP 以 MIT 许可证发布，完整文本见 [LICENSE](LICENSE)。
+
+### 第三方组件
+
+| 组件 | 版本/提交 | 许可证 | 用途 |
+|---|---|---|---|
+| [giflib](https://giflib.sourceforge.net/) | 5.2.2 | MIT（Copyright © 1997 Eric S. Raymond） | GIF/LZW 解码 |
+| [Lua](https://www.lua.org/) | 5.4.7 | MIT（Copyright © 1994–2024 Lua.org, PUC-Rio） | 沙箱脚本运行时；`lstrlib.c` 的模式匹配工作量补丁仍属 Lua |
+| [rxi/log.c](https://github.com/rxi/log.c) | commit `f9ea349` | MIT（Copyright © 2020 rxi） | 日志核心 |
+
+完整第三方许可证文本见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。CMake、Python、Pillow 和 Visual Studio/MSVC 只用于构建和测试，不会被链接进 `yagp.exe`，也不随二进制分发。
+
+除上述第三方组件外，本仓库的源代码、脚本、文档和 `example/` 中的演示素材均按 MIT 许可证发布。

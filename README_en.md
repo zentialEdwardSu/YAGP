@@ -409,3 +409,25 @@ the user's profile.
   path) and its fixed wording is English; paths and messages keep their bytes.
 - Terminal output requires `--verbose`/`-v`; hosts without a console (Explorer,
   some Git Bash/pty setups) only get redirected handles or DebugView.
+
+## License
+
+YAGP is released under the MIT License; see [LICENSE](LICENSE) for the full
+text.
+
+### Third-party components
+
+| Component | Version/commit | License | Use |
+|---|---|---|---|
+| [giflib](https://giflib.sourceforge.net/) | 5.2.2 | MIT (Copyright (c) 1997 Eric S. Raymond) | GIF/LZW decoding |
+| [Lua](https://www.lua.org/) | 5.4.7 | MIT (Copyright (c) 1994-2024 Lua.org, PUC-Rio) | Sandboxed scripting runtime; the `lstrlib.c` pattern-work patch remains under the Lua license |
+| [rxi/log.c](https://github.com/rxi/log.c) | commit `f9ea349` | MIT (Copyright (c) 2020 rxi) | Logging core |
+
+The complete third-party license texts are in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). CMake, Python, Pillow and
+Visual Studio/MSVC are build/test tools only; they are not linked into
+`yagp.exe` and are not distributed with it.
+
+Except for the third-party components above, the source code, scripts,
+documentation and the demo assets in `example/` are released under the MIT
+License.
