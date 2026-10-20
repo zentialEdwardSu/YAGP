@@ -1,4 +1,5 @@
 #include "app.h"
+#include "group.h"
 #include "applog.h"
 #include "config.h"
 #include "cursor_hook.h"
@@ -41,8 +42,14 @@ enum {
     TRAY_CMD_AUTOSTART,
     TRAY_CMD_LOG,
     TRAY_CMD_EXIT,
-    TRAY_CMD_OVERLAY_BASE = 1000
+    TRAY_CMD_GROUP_IMPORT = 20,
+    TRAY_CMD_OVERLAY_BASE = 1000,
+    TRAY_CMD_GROUP_BASE = 1000000,   /* + group index * 4 + action */
+    TRAY_CMD_MASTER_BASE = 2000000   /* + master overlay id */
 };
+#define GROUP_ACTION_HIDE 0
+#define GROUP_ACTION_REMOVE 1
+#define GROUP_MENU_SPAN 4
 
 App g_app;
 static int s_cascade;
@@ -54,6 +61,12 @@ int64_t app_now(void)
     LARGE_INTEGER t;
     QueryPerformanceCounter(&t);
     return t.QuadPart;
+}
+
+uint64_t app_uid_alloc(void)
+{
+    if (!g_app.next_uid) g_app.next_uid = 1;
+    return g_app.next_uid++;
 }
 
 void app_reschedule(void)
@@ -133,13 +146,29 @@ static void save_now(void)
 {
     KillTimer(g_app.tray_hwnd, TIMER_SAVE);
     if (!g_app.persist) return;
-    int count = 0;
+    int group_count = 0, count = 0;
+    for (Group *g = g_app.groups; g; g = g->next) ++group_count;
     for (Overlay *o = g_app.overlays; o; o = o->next) ++count;
-    OverlayConfig *entries = count ? (OverlayConfig *)malloc((size_t)count * sizeof(OverlayConfig)) : NULL;
-    if (count && !entries) return;
+    GroupConfig *groups = group_count ? (GroupConfig *)calloc((size_t)group_count, sizeof(*groups)) : NULL;
+    OverlayConfig *entries = count ? (OverlayConfig *)malloc((size_t)count * sizeof(*entries)) : NULL;
+    if ((group_count && !groups) || (count && !entries)) {
+        free(groups);
+        free(entries);
+        return;
+    }
+    int gi = 0;
+    for (Group *g = g_app.groups; g; g = g->next) {
+        groups[gi].uid = g->uid;
+        groups[gi].name = g->name;
+        groups[gi].folder = g->folder;
+        groups[gi].hidden = g->hidden;
+        ++gi;
+    }
     int i = 0;
     for (Overlay *o = g_app.overlays; o; o = o->next) overlay_to_config(o, &entries[i++]);
-    config_save(entries, count);
+    ConfigSave data = {groups, group_count, entries, count};
+    config_save(&data);
+    free(groups);
     free(entries);
 }
 
@@ -181,19 +210,81 @@ static void add_overlay_from_path(const wchar_t *path, void *ctx)
     app_changed();
 }
 
+#define RESTORE_MAX 256
+typedef struct RestoreItem {
+    Overlay *o;
+    uint64_t master_uid;
+} RestoreItem;
+static RestoreItem s_restore[RESTORE_MAX];
+static int s_restore_n;
+static int s_restored;
+
+static void bump_uid(uint64_t uid)
+{
+    if (uid >= g_app.next_uid) g_app.next_uid = uid + 1;
+}
+
+static void restore_group(const GroupConfig *cfg, void *ctx)
+{
+    (void)ctx;
+    Group *g = group_create(cfg->name, cfg->folder);
+    if (!g) return;
+    if (cfg->uid) g->uid = cfg->uid;
+    g->hidden = cfg->hidden;
+    bump_uid(g->uid);
+}
+
 static void restore_overlay(const OverlayConfig *cfg, void *ctx)
 {
-    int *count = (int *)ctx;
+    (void)ctx;
+    if (s_restore_n >= RESTORE_MAX) return;
     if (GetFileAttributesW(cfg->path) == INVALID_FILE_ATTRIBUTES) {
         char u8[MAX_PATH * 4];
         log_warn("skipping missing GIF: %s", applog_u8(cfg->path, u8, sizeof(u8)));
         return;
     }
-    Overlay *o = overlay_create(cfg, true, s_cascade++);
-    if (o) {
-        link_overlay(o);
-        if (count) ++*count;
+    OverlayConfig copy = *cfg;
+    copy.defer_script = true;
+    Overlay *o = overlay_create(&copy, true, s_cascade++);
+    if (!o) return;
+    if (cfg->uid) o->uid = cfg->uid;
+    bump_uid(o->uid);
+    if (cfg->group_uid) o->group = group_find_uid(cfg->group_uid);
+    link_overlay(o);
+    s_restore[s_restore_n].o = o;
+    s_restore[s_restore_n].master_uid = cfg->master_uid;
+    ++s_restore_n;
+    ++s_restored;
+}
+
+static void finish_restore(void)
+{
+    for (int i = 0; i < s_restore_n; ++i) {
+        Overlay *o = s_restore[i].o;
+        if (!s_restore[i].master_uid) continue;
+        Overlay *master = NULL;
+        for (int j = 0; j < s_restore_n; ++j) {
+            if (s_restore[j].o->uid == s_restore[i].master_uid) {
+                master = s_restore[j].o;
+                break;
+            }
+        }
+        if (master && master != o && !master->master && !overlay_has_slaves(o))
+            o->master = master;
     }
+    for (int i = 0; i < s_restore_n; ++i) {
+        Overlay *o = s_restore[i].o;
+        if (!o->master && o->script_spec && *o->script_spec) overlay_set_script(o, o->script_spec);
+        overlay_refresh_visibility(o);
+    }
+    Group *g = g_app.groups;
+    while (g) {
+        Group *next = g->next;
+        if (group_is_empty(g)) group_destroy(g);
+        g = next;
+    }
+    s_restore_n = 0;
+    overlay_refresh_hook();
 }
 
 void app_remove_overlay(Overlay *o)
@@ -202,17 +293,20 @@ void app_remove_overlay(Overlay *o)
         g_app.pick_target = NULL;
         g_app.pick_id = 0;
     }
+    Group *group = o->group;
+    if (overlay_has_slaves(o)) overlay_master_removed(o);
     for (Overlay **p = &g_app.overlays; *p; p = &(*p)->next) {
         if (*p == o) {
             *p = o->next;
             o->next = NULL;
-            if (!o->hidden) overlay_announce(o, false);
+            if (!o->hidden && !(group && group->hidden)) overlay_announce(o, false);
             char u8[MAX_PATH * 4];
             log_info("removed GIF #%d: %s", o->id, applog_u8(overlay_name(o), u8, sizeof(u8)));
             overlay_destroy(o);
             break;
         }
     }
+    group_after_member_removed(group);
     overlay_refresh_hook();
     app_changed();
 }
@@ -279,6 +373,7 @@ static const wchar_t *pick_verb(PickKind kind)
     case PICK_SCRIPT: return L"script";
     case PICK_NEW_SCRIPT: return L"newscript";
     case PICK_LOG_DIR: return L"logdir";
+    case PICK_GROUP: return L"group";
     default: return L"add";
     }
 }
@@ -364,6 +459,11 @@ static void app_pick_log_dir(void)
     }
 }
 
+static void app_pick_group(void)
+{
+    launch_picker(PICK_GROUP, NULL, NULL);
+}
+
 /* Payload: uint64 id, then NUL separated full paths, double-NUL terminated. */
 static void handle_pick_result(const COPYDATASTRUCT *cds)
 {
@@ -390,6 +490,20 @@ static void handle_pick_result(const COPYDATASTRUCT *cds)
             log_error("cannot create log file in %s (error %lu)", applog_u8(p, u8, sizeof(u8)),
                       (unsigned long)err);
             app_error(TXT_ERR_LOG_OPEN, p);
+        }
+        return;
+    }
+    if (g_app.pick_kind == PICK_GROUP) {
+        if (!*p) {
+            log_debug("picker returned no group folder");
+            return;
+        }
+        wchar_t err[512];
+        if (!group_import_folder(p, err, ARRAYSIZE(err))) {
+            log_warn("group import failed: %ls", err);
+            app_notify(TXT_GROUP_IMPORT_TITLE, err);
+        } else {
+            app_notify(TXT_GROUP_IMPORT_TITLE, TXT_GROUP_IMPORT_DONE);
         }
         return;
     }
@@ -502,6 +616,39 @@ static int CALLBACK browse_init(HWND hwnd, UINT msg, LPARAM lp, LPARAM data)
     return 0;
 }
 
+static int run_pick_group(int argc, wchar_t **argv, uint64_t id)
+{
+    (void)argc;
+    (void)argv;
+    wchar_t initial[MAX_PATH * 2] = L"";
+    PWSTR docs = NULL;
+    if (SUCCEEDED(SHGetKnownFolderPath(&FOLDERID_Documents, 0, NULL, &docs))) {
+        wcsncpy_s(initial, ARRAYSIZE(initial), docs, _TRUNCATE);
+        CoTaskMemFree(docs);
+    }
+    BROWSEINFOW bi;
+    memset(&bi, 0, sizeof(bi));
+    wchar_t display[MAX_PATH] = L"";
+    bi.pszDisplayName = display;
+    bi.lpszTitle = TXT_TITLE_PICK_GROUP;
+    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_USENEWUI;
+    bi.lpfn = browse_init;
+    bi.lParam = (LPARAM)(initial[0] ? initial : NULL);
+    PIDLIST_ABSOLUTE pidl = SHBrowseForFolderW(&bi);
+    if (!pidl) return 0;
+    wchar_t path[MAX_PATH * 2];
+    bool ok = SHGetPathFromIDListW(pidl, path) != FALSE;
+    CoTaskMemFree(pidl);
+    if (!ok) return 1;
+    size_t used = wcslen(path) + 2;
+    wchar_t *out = (wchar_t *)calloc(used, sizeof(wchar_t));
+    if (!out) return 1;
+    memcpy(out, path, (used - 2) * sizeof(wchar_t));
+    send_pick_result(id, out, used);
+    free(out);
+    return 0;
+}
+
 /* "--pick logdir <id> [<initial folder>]": choose where the log file goes. */
 static int run_pick_log_dir(int argc, wchar_t **argv, uint64_t id)
 {
@@ -548,6 +695,12 @@ static int run_picker(int argc, wchar_t **argv)
         if (SUCCEEDED(com)) CoUninitialize();
         return rc;
     }
+    if (argc >= 4 && wcscmp(argv[2], L"group") == 0) {
+        HRESULT com = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        int rc = run_pick_group(argc, argv, wcstoull(argv[3], NULL, 16));
+        if (SUCCEEDED(com)) CoUninitialize();
+        return rc;
+    }
     if (argc >= 4 && wcscmp(argv[2], L"logdir") == 0) {
         HRESULT com = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
         int rc = run_pick_log_dir(argc, argv, wcstoull(argv[3], NULL, 16));
@@ -571,10 +724,11 @@ static int run_picker(int argc, wchar_t **argv)
     OPENFILENAMEW ofn;
     memset(&ofn, 0, sizeof(ofn));
     ofn.lStructSize = sizeof(ofn);
-    ofn.lpstrFilter = script ? TXT_FILTER_LUA : TXT_FILTER_GIF;
+    ofn.lpstrFilter = script ? TXT_FILTER_LUA : TXT_FILTER_MEDIA;
     ofn.lpstrFile = buf;
     ofn.nMaxFile = cap;
-    ofn.lpstrTitle = multi ? TXT_TITLE_ADD_GIF : script ? TXT_TITLE_PICK_SCRIPT : TXT_TITLE_REPLACE_GIF;
+    ofn.lpstrTitle = script ? TXT_TITLE_PICK_SCRIPT
+                            : multi ? TXT_TITLE_ADD_MEDIA : TXT_TITLE_REPLACE_MEDIA;
     ofn.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY |
                 (multi ? OFN_ALLOWMULTISELECT : 0);
     if (!GetOpenFileNameW(&ofn)) {
@@ -771,7 +925,17 @@ static void clear_config(void)
     LSTATUS run = RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE);
     bool run_ok = run == ERROR_SUCCESS || run == ERROR_FILE_NOT_FOUND;
     bool config_ok = config_delete_all();
-    if (config_ok) g_app.persist = false;
+    if (config_ok) {
+        g_app.persist = false;
+        while (g_app.groups) group_destroy(g_app.groups);
+        for (Overlay *o = g_app.overlays; o; o = o->next) {
+            if (o->master) {
+                o->master = NULL;
+                if (o->script_spec && *o->script_spec) overlay_set_script(o, o->script_spec);
+            }
+        }
+        g_app.next_uid = 1;
+    }
     if (config_ok && run_ok) {
         log_info("settings data deleted: %s", applog_u8(dir, u8, sizeof(u8)));
         app_notify(TXT_CONFIG_DELETED, dir);
@@ -790,6 +954,24 @@ static void show_tray_menu(void)
     if (!menu) return;
     bool any_paused = false, any_playing = false;
     AppendMenuW(menu, MF_STRING, TRAY_CMD_ADD, TXT_MENU_ADD_GIF);
+    HMENU groups = CreatePopupMenu();
+    if (groups) {
+        AppendMenuW(groups, MF_STRING, TRAY_CMD_GROUP_IMPORT, TXT_MENU_GROUP_IMPORT);
+        if (g_app.groups) AppendMenuW(groups, MF_SEPARATOR, 0, NULL);
+        UINT gi = 0;
+        for (Group *g = g_app.groups; g; g = g->next, ++gi) {
+            HMENU gs = CreatePopupMenu();
+            if (!gs) continue;
+            UINT base = TRAY_CMD_GROUP_BASE + gi * GROUP_MENU_SPAN;
+            AppendMenuW(gs, MF_STRING, base + GROUP_ACTION_HIDE,
+                        g->hidden ? TXT_MENU_GROUP_SHOW : TXT_MENU_GROUP_HIDE);
+            AppendMenuW(gs, MF_STRING, base + GROUP_ACTION_REMOVE, TXT_MENU_GROUP_REMOVE);
+            wchar_t label[MAX_PATH + 32];
+            _snwprintf_s(label, ARRAYSIZE(label), _TRUNCATE, L"%s (%d)", g->name, group_member_count(g));
+            AppendMenuW(groups, MF_POPUP, (UINT_PTR)gs, label);
+        }
+        AppendMenuW(menu, MF_POPUP, (UINT_PTR)groups, TXT_MENU_GROUPS);
+    }
     if (g_app.overlays) AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     UINT index = 0;
     for (Overlay *o = g_app.overlays; o; o = o->next, ++index) {
@@ -821,6 +1003,27 @@ static void show_tray_menu(void)
     UINT cmd = app_track_menu(menu, pt.x, pt.y);
     DestroyMenu(menu);
 
+    if (cmd >= OVERLAY_MASTER_CMD_BASE) {
+        overlay_master_command(cmd);
+        return;
+    }
+    if (cmd >= TRAY_CMD_GROUP_BASE && cmd < TRAY_CMD_MASTER_BASE) {
+        UINT rel = cmd - TRAY_CMD_GROUP_BASE;
+        UINT target = rel / GROUP_MENU_SPAN;
+        UINT action = rel % GROUP_MENU_SPAN;
+        Group *g = g_app.groups;
+        for (UINT i = 0; g && i < target; ++i) g = g->next;
+        if (!g) return;
+        if (action == GROUP_ACTION_HIDE) {
+            group_set_hidden(g, !g->hidden);
+        } else if (action == GROUP_ACTION_REMOVE) {
+            if (MessageBoxW(g_app.tray_hwnd, TXT_GROUP_REMOVE_CONFIRM, L"YAGP",
+                            MB_YESNO | MB_ICONQUESTION) == IDYES) {
+                group_remove(g);
+            }
+        }
+        return;
+    }
     if (cmd >= TRAY_CMD_OVERLAY_BASE) {
         UINT rel = cmd - TRAY_CMD_OVERLAY_BASE;
         UINT target = rel / OVERLAY_CMD_SPAN;
@@ -832,6 +1035,9 @@ static void show_tray_menu(void)
     switch (cmd) {
     case TRAY_CMD_ADD:
         app_pick_files(PICK_ADD, NULL);
+        break;
+    case TRAY_CMD_GROUP_IMPORT:
+        app_pick_group();
         break;
     case TRAY_CMD_PAUSE_ALL:
     case TRAY_CMD_RESUME_ALL:
@@ -1134,9 +1340,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmdline, int show)
     }
     g_app.tray_icon = make_tray_icon();
     tray_add_icon();
-    int restored = 0;
-    config_load(restore_overlay, &restored);
-    log_info("restored %d GIF(s) from config", restored);
+    config_load(restore_overlay, restore_group, NULL);
+    finish_restore();
+    log_info("restored %d GIF(s) from config", s_restored);
     overlay_refresh_hook(); /* Restored scripts' cursor / input subscriptions. */
     for (int i = 1; argv && i < argc; ++i) {
         wchar_t full[MAX_PATH * 4];
@@ -1168,6 +1374,7 @@ shutdown:
     if (g_app.pick_process) TerminateProcess(g_app.pick_process, 0);
     pick_close();
     save_now();
+    g_app.shutting_down = true;
     destroy_all_overlays();
     tray_remove_icon();
 done:

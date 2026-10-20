@@ -11,6 +11,7 @@
 #include "dx11_renderer.h"
 
 typedef struct Overlay Overlay;
+typedef struct Group Group;
 
 /* Process-wide state. Everything runs on the single UI thread. */
 typedef struct App {
@@ -20,6 +21,9 @@ typedef struct App {
     UINT msg_taskbar_created;
     RenderDevice *device;
     Overlay *overlays;       /* Singly linked list, in creation order. */
+    Group *groups;           /* Group list, in creation order. */
+    uint64_t next_uid;       /* Source of stable config ids (overlays and groups). */
+    bool shutting_down;
     HANDLE frame_timer;      /* Waitable timer armed for the earliest due frame. */
     int64_t qpc_freq;
     int modal_depth;         /* >0 while a menu, dialog or drag runs its own loop. */
@@ -38,6 +42,8 @@ typedef struct App {
 extern App g_app;
 
 int64_t app_now(void);
+/* Allocates a stable, never-reused-in-this-config id. */
+uint64_t app_uid_alloc(void);
 /* State changed: re-arm the frame timer and schedule a config save. */
 void app_changed(void);
 void app_reschedule(void);
@@ -48,7 +54,7 @@ void app_modal_begin(void);
 void app_modal_end(void);
 /* Shows a popup menu owned by the tray window and returns the chosen command (0 = none). */
 UINT app_track_menu(HMENU menu, int x, int y);
-typedef enum PickKind { PICK_ADD, PICK_REPLACE, PICK_SCRIPT, PICK_NEW_SCRIPT, PICK_LOG_DIR } PickKind;
+typedef enum PickKind { PICK_ADD, PICK_REPLACE, PICK_SCRIPT, PICK_NEW_SCRIPT, PICK_LOG_DIR, PICK_GROUP } PickKind;
 /* Opens the file dialog in a helper process and returns immediately. Results
  * arrive later: PICK_ADD adds every chosen file, PICK_REPLACE replaces target,
  * PICK_SCRIPT binds the chosen .lua file to target, PICK_LOG_DIR enables

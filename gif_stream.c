@@ -135,6 +135,14 @@ int gif_stream_set_output_size(GifStream *g, int out_w, int out_h)
     if (out_w > g->width) out_w = g->width;
     if (out_h > g->height) out_h = g->height;
     if (g->bgra && out_w == g->out_w && out_h == g->out_h) return 0;
+    if (g->is_still) {
+        if (still_image_set_output_size(&g->still, out_w, out_h) != 0) return -1;
+        g->bgra = g->still.bgra;
+        g->out_w = out_w;
+        g->out_h = out_h;
+        g->canvas_fresh = 1;
+        return 0;
+    }
     uint8_t *bgra = (uint8_t *)calloc((size_t)out_w * (size_t)out_h, 4);
     int *xmap = (int *)malloc((size_t)out_w * sizeof(int));
     int *ymap = (int *)malloc((size_t)out_h * sizeof(int));
@@ -170,16 +178,39 @@ int gif_stream_set_output_size(GifStream *g, int out_w, int out_h)
 
 void gif_stream_map_box(const GifStream *g, int l, int t, int r, int b, int out[4])
 {
+    if (g->is_still) {
+        out[0] = out[1] = out[2] = out[3] = 0;
+        return;
+    }
     out[0] = lower_bound(g->xmap, g->out_w, l);
     out[1] = lower_bound(g->ymap, g->out_h, t);
     out[2] = lower_bound(g->xmap, g->out_w, r);
     out[3] = lower_bound(g->ymap, g->out_h, b);
 }
 
+static bool is_png(const uint8_t *d, size_t n)
+{
+    static const uint8_t sig[8] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+    return n >= sizeof(sig) && memcmp(d, sig, sizeof(sig)) == 0;
+}
+
+static bool is_jpeg(const uint8_t *d, size_t n)
+{
+    return n >= 3 && d[0] == 0xFF && d[1] == 0xD8 && d[2] == 0xFF;
+}
+
 int gif_stream_open(GifStream *g, const wchar_t *path)
 {
     memset(g, 0, sizeof(*g));
     if (map_file(g, path) < 0) goto error;
+    if (is_png(g->data, g->size) || is_jpeg(g->data, g->size)) {
+        if (still_image_open_memory(&g->still, g->data, g->size) != 0) goto error;
+        g->is_still = true;
+        g->width = g->still.width;
+        g->height = g->still.height;
+        g->delay_ms = 0;
+        return 0;
+    }
     if (start_decoder(g) < 0) goto error;
     g->width = g->decoder->SWidth;
     g->height = g->decoder->SHeight;
@@ -200,6 +231,10 @@ void gif_stream_close(GifStream *g)
     if (g->data) UnmapViewOfFile(g->data);
     if (g->mapping) CloseHandle((HANDLE)g->mapping);
     if (g->file) CloseHandle((HANDLE)g->file);
+    if (g->is_still) {
+        g->bgra = NULL; /* Owned by g->still. */
+        still_image_close(&g->still);
+    }
     free(g->bgra);
     free(g->backup);
     free(g->scanline);
@@ -211,6 +246,10 @@ void gif_stream_close(GifStream *g)
 
 int gif_stream_restart(GifStream *g)
 {
+    if (g->is_still) {
+        g->still_shown = false;
+        return g->bgra ? 0 : -1;
+    }
     close_decoder(g);
     if (start_decoder(g) < 0) return -1;
     if (g->width != g->decoder->SWidth || g->height != g->decoder->SHeight) {
@@ -263,6 +302,12 @@ void gif_stream_set_color_key(GifStream *g, int enabled, uint32_t rgb, int toler
     g->key_enabled = enabled != 0;
     g->key_rgb = rgb & 0xFFFFFFu;
     g->key_tolerance = tolerance < 0 ? 0 : tolerance > 255 ? 255 : tolerance;
+    if (g->is_still) {
+        still_image_set_color_key(&g->still, g->key_enabled, g->key_rgb, g->key_tolerance);
+        g->bgra = g->still.bgra;
+        g->out_w = g->still.out_w;
+        g->out_h = g->still.out_h;
+    }
 }
 
 static int hex_digit(wchar_t c)
@@ -396,6 +441,7 @@ static int read_image(GifStream *g)
 
 int gif_stream_seek(GifStream *g, size_t offset)
 {
+    if (g->is_still) return -1;
     if (!g->decoder && start_decoder(g) < 0) return -1;
     /* giflib reads straight from gif_input with no read-ahead, and every frame
      * is consumed up to its block terminator, so between frames its only
@@ -413,6 +459,7 @@ int gif_stream_seek(GifStream *g, size_t offset)
 
 int gif_stream_snapshot_save(const GifStream *g, GifSnapshot *s)
 {
+    if (g->is_still) return -1;
     size_t bytes = (size_t)g->out_w * (size_t)g->out_h * 4;
     memset(s, 0, sizeof(*s));
     s->bgra = (uint8_t *)malloc(bytes);
@@ -436,6 +483,7 @@ int gif_stream_snapshot_save(const GifStream *g, GifSnapshot *s)
 
 int gif_stream_snapshot_restore(GifStream *g, const GifSnapshot *s)
 {
+    if (g->is_still) return -1;
     if (!s->bgra || s->out_w != g->out_w || s->out_h != g->out_h) return -1;
     if (!g->decoder && start_decoder(g) < 0) return -1;
     size_t bytes = (size_t)g->out_w * (size_t)g->out_h * 4;
@@ -464,6 +512,12 @@ void gif_stream_snapshot_free(GifSnapshot *s)
 int gif_stream_next(GifStream *g)
 {
     GifRecordType type;
+    if (g->is_still) {
+        if (g->still_shown || !g->bgra) return 0;
+        g->still_shown = true;
+        g->delay_ms = 0;
+        return 1;
+    }
     if (!g->decoder) return -1;
     size_t start = g->pos; /* The frame's first record (usually its graphics control extension). */
     for (;;) {

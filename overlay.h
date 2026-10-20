@@ -45,8 +45,11 @@ enum {
     OVERLAY_CMD_SCRIPT_NEW_FLEE,
     OVERLAY_CMD_SCRIPT_NEW_LOOK,
     OVERLAY_CMD_HIDE,             /* Toggle: hide (keep in the tray) / show again. */
+    OVERLAY_CMD_MASTER_NONE,
     OVERLAY_CMD_SPAN = 32
 };
+
+#define OVERLAY_MASTER_CMD_BASE 2000000u
 
 #define OVERLAY_MAX_CLIPS 32
 
@@ -76,6 +79,10 @@ typedef struct Overlay {
     /* Window hidden and swap chain released: no animation, no script ticks, not
      * seen by other scripts. Shown again from the tray menu. */
     bool hidden;
+    struct Group *group;  /* NULL = not in a group. */
+    uint64_t uid;         /* Stable config identity. */
+    struct Overlay *master; /* NULL = not a slave. */
+    bool still_image;     /* PNG/JPG/JPEG: animation controls are unavailable. */
     bool key_enabled;     /* Colour key applied while compositing. */
     uint32_t key_rgb;     /* 0xRRGGBB */
     int key_tolerance;    /* Per-channel, 0-255. */
@@ -155,6 +162,14 @@ void overlay_announce(Overlay *o, bool added);
 /* Hide (keep loaded) or show again. Showing re-centres a GIF whose monitor
  * has gone away meanwhile. */
 void overlay_set_hidden(Overlay *o, bool hidden);
+/* Re-applies the effective visibility (member hidden OR group hidden). */
+void overlay_refresh_visibility(Overlay *o);
+
+bool overlay_has_slaves(const Overlay *o);
+bool overlay_bind_master(Overlay *slave, Overlay *master, wchar_t *err, size_t cap);
+void overlay_unbind_master(Overlay *slave, bool reload_script);
+void overlay_master_removed(Overlay *master);
+void overlay_master_command(UINT cmd);
 
 /* Device-loss recovery: drop / rebuild the swap chain on g_app.device. */
 void overlay_detach_surface(Overlay *o);

@@ -222,7 +222,12 @@ bool clip_open(Clip *c, const char *name, const wchar_t *path, const ClipKey *ke
         clip_close(c);
         return false;
     }
-    load_cache(c, key);
+    if (c->gif->is_still) {
+        c->frame_count = 1;
+        memcpy(c->opaque, c->gif->still.opaque, sizeof(c->opaque));
+    } else {
+        load_cache(c, key);
+    }
     return true;
 }
 
@@ -256,6 +261,11 @@ bool clip_activate(Clip *c, int pct)
 bool clip_rekey(Clip *c, const ClipKey *key, int pct)
 {
     gif_stream_set_color_key(c->gif, key->enabled, key->rgb, key->tolerance);
+    if (c->gif->is_still) {
+        memcpy(c->opaque, c->gif->still.opaque, sizeof(c->opaque));
+        if (c->parked) return true;
+        return clip_activate(c, pct);
+    }
     load_cache(c, key);
     if (c->parked) return true; /* Re-keyed from frame 0 when it next plays. */
     return clip_activate(c, pct);

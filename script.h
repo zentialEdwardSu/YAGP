@@ -23,7 +23,11 @@ typedef struct ScriptPeer {
     double hx, hy;          /* Hitbox (visible area) top-left on the desktop. */
     int hw, hh;
     bool scripted, paused;
-    const char *name;       /* UTF-8 GIF file name, owned by the host. */
+    bool still;             /* PNG/JPG/JPEG, no animation. */
+    bool controlled;        /* Slave of another overlay. */
+    bool master;            /* Has at least one slave. */
+    int master_id;          /* 0 unless controlled. */
+    const char *name;       /* UTF-8 media file name, owned by the host. */
 } ScriptPeer;
 
 #define SCRIPT_MAX_PEERS 64
@@ -100,6 +104,17 @@ typedef struct ScriptPlay {
 typedef enum ScriptEasing { SEASE_LINEAR, SEASE_IN, SEASE_OUT, SEASE_IN_OUT } ScriptEasing;
 typedef enum ScriptCursor { SCURSOR_MOVE, SCURSOR_ARROW, SCURSOR_HAND, SCURSOR_NONE } ScriptCursor;
 
+/* Direct slaves of the script's overlay, plus target state used by the
+ * chainable slave handles. The host returns an Overlay* as `target`. */
+typedef struct ScriptSlaveOps {
+    int (*list)(void *master_ctx, int *ids, int cap);
+    void *(*resolve)(void *master_ctx, int id);
+    const char *(*name)(void *master_ctx, int id);
+    bool (*get_hidden)(void *target);
+    bool (*get_paused)(void *target);
+    bool (*is_static)(void *target);
+} ScriptSlaveOps;
+
 typedef struct ScriptHostExtOps {
     /* Clips. Errors are UTF-8 messages for the script (returned as nil, err). */
     bool (*load_clip)(void *ctx, const char *name, const char *relpath, char *err, size_t cap);
@@ -127,6 +142,11 @@ typedef struct ScriptHostExtOps {
      * the script host. Returns false when the host cannot show one. NULL =
      * notifications are unavailable (e.g. script_create without ext). */
     bool (*notify)(void *ctx, const char *title, const char *text);
+    /* Still image: animation controls are unavailable. */
+    bool (*is_static)(void *ctx);
+    void (*set_hidden)(void *ctx, bool hidden);
+    void (*set_paused)(void *ctx, bool paused);
+    const ScriptSlaveOps *slaves;
 } ScriptHostExtOps;
 
 typedef struct Script Script;

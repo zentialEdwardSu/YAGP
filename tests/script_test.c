@@ -31,6 +31,9 @@ typedef struct FakeWin {
     int gw, gh;
     bool ovr;
     int ovr_box[4];
+    bool still;
+    bool hidden;
+    bool paused;
 } FakeWin;
 
 /* Same mapping the real host uses (overlay_hitbox). out = dx, dy, w, h. */
@@ -1152,7 +1155,46 @@ static bool x_notify(void *ctx, const char *title, const char *text)
 
 static const ScriptHostExtOps EXT = {x_load_clip, x_unload_clip, x_clip_info, x_play, x_seek, x_get_frame,
                                      x_set_speed, x_set_playing, x_set_matrix, x_set_opacity, x_set_cursor,
-                                     x_set_draggable, x_set_clickthrough, x_subs_changed, x_now, x_notify};
+                                     x_set_draggable, x_set_clickthrough, x_subs_changed, x_now, x_notify,
+                                     NULL, NULL, NULL, NULL};
+
+/* A very small fake master/slave world for the chainable handle tests. */
+static FakeWin *s_slave;
+
+static int slave_list(void *ctx, int *ids, int cap)
+{
+    (void)ctx;
+    if (!s_slave || cap < 1) return 0;
+    ids[0] = s_slave->id;
+    return 1;
+}
+static void *slave_resolve(void *ctx, int id)
+{
+    (void)ctx;
+    return s_slave && s_slave->id == id ? s_slave : NULL;
+}
+static const char *slave_name(void *ctx, int id)
+{
+    (void)ctx;
+    return s_slave && s_slave->id == id ? "slave" : NULL;
+}
+static bool slave_hidden(void *target) { return ((FakeWin *)target)->hidden; }
+static bool slave_paused(void *target) { return ((FakeWin *)target)->paused; }
+static bool slave_static(void *target) { return ((FakeWin *)target)->still; }
+
+static const ScriptSlaveOps SLAVE_OPS = {slave_list, slave_resolve, slave_name,
+                                         slave_hidden, slave_paused, slave_static};
+
+static const ScriptHostExtOps EXT_SLAVES = {
+    x_load_clip, x_unload_clip, x_clip_info, x_play, x_seek, x_get_frame,
+    x_set_speed, x_set_playing, x_set_matrix, x_set_opacity, x_set_cursor,
+    x_set_draggable, x_set_clickthrough, x_subs_changed, x_now, x_notify,
+    NULL, NULL, NULL, &SLAVE_OPS};
+
+static Script *load_ext_slave(FakeWin *w, const char *src, wchar_t *err)
+{
+    return script_create_ex(&OPS, &EXT_SLAVES, w, src, strlen(src), "test.lua", "test.gif", w->id, err, 512);
+}
 
 static Script *load_ext(FakeWin *w, const char *src, wchar_t *err)
 {
@@ -1757,6 +1799,52 @@ static void test_log_no_ext(void)
     script_destroy(s);
 }
 
+static void test_slave_api(void)
+{
+    wchar_t err[512];
+    FakeWin master = {0, 0, 50, 50, false, 0, 0};
+    FakeWin slave = {200, 200, 40, 40, false, 0, 0};
+    master.id = 1;
+    slave.id = 7;
+    s_slave = &slave;
+    memset(&s_ext, 0, sizeof(s_ext));
+    Script *s = load_ext_slave(&master,
+        "local h = yagp.slave(7) assert(h)\n"
+        "assert(#yagp.slaves() == 1 and yagp.slave(99) == nil)\n"
+        "local r = h:set_pos(11, 22):set_flip(true):set_opacity(0.5, 0)\n"
+        "assert(r == h)\n"
+        "local x, y = h:pos() assert(x == 11 and y == 22)\n"
+        "assert(h:id() == 7 and h:name() == 'slave')\n"
+        "keep = h\n"
+        "function dead() assert(yagp.slave(7) == nil)\n"
+        "  assert(keep:set_pos(1, 2) == keep) assert(keep:pos() == nil) end\n", err);
+    CHECK(s, "slave load: %ls", err);
+    if (s) {
+        CHECK(slave.x == 11 && slave.y == 22 && slave.flip, "slave chain setters");
+        s_slave = NULL;
+        CHECK(run_check(s, "dead"), "deleted slave handle");
+        script_destroy(s);
+    }
+
+    FakeWin master2 = {0, 0, 50, 50, false, 0, 0};
+    FakeWin image = {200, 200, 40, 40, false, 0, 0};
+    master2.id = 2;
+    image.id = 8;
+    image.still = true;
+    s_slave = &image;
+    s = load_ext_slave(&master2,
+        "local h = yagp.slave(8) assert(h)\n"
+        "local ok, e = h:play('walk') assert(ok == nil and e)\n"
+        "assert(h:set_pos(3, 4) == h)\n"
+        "local x, y = h:pos() assert(x == 3 and y == 4)\n", err);
+    CHECK(s, "static slave load: %ls", err);
+    if (s) {
+        CHECK(image.x == 3 && image.y == 4, "static slave movement");
+        script_destroy(s);
+    }
+    s_slave = NULL;
+}
+
 int main(void)
 {
     /* script.c logs through rxi/log.c; capture the lines and keep stderr quiet. */
@@ -1785,6 +1873,7 @@ int main(void)
     test_log_rate_limit();
     test_lua_notify();
     test_log_no_ext();
+    test_slave_api();
     if (s_failures) {
         printf("%d check(s) failed\n", s_failures);
         return 1;

@@ -319,10 +319,11 @@ static int l_fits(lua_State *L)
     return 1;
 }
 
-/* { id, name, x, y, w, h, hx, hy, hw, hh, cx, cy, vx, vy, scripted, paused } */
+/* { id, name, x, y, w, h, hx, hy, hw, hh, cx, cy, vx, vy, scripted, paused,
+ *   still, controlled, master, master_id } */
 static void push_peer(lua_State *L, const ScriptPeer *p)
 {
-    lua_createtable(L, 0, 16);
+    lua_createtable(L, 0, 20);
     lua_pushinteger(L, p->id);                   lua_setfield(L, -2, "id");
     lua_pushstring(L, p->name ? p->name : "");   lua_setfield(L, -2, "name");
     lua_pushnumber(L, p->x);                     lua_setfield(L, -2, "x");
@@ -339,6 +340,10 @@ static void push_peer(lua_State *L, const ScriptPeer *p)
     lua_pushnumber(L, p->vy);                    lua_setfield(L, -2, "vy");
     lua_pushboolean(L, p->scripted);             lua_setfield(L, -2, "scripted");
     lua_pushboolean(L, p->paused);               lua_setfield(L, -2, "paused");
+    lua_pushboolean(L, p->still);                 lua_setfield(L, -2, "still");
+    lua_pushboolean(L, p->controlled);            lua_setfield(L, -2, "controlled");
+    lua_pushboolean(L, p->master);                lua_setfield(L, -2, "master");
+    lua_pushinteger(L, p->master_id);             lua_setfield(L, -2, "master_id");
 }
 
 static int read_peers(Script *s, ScriptPeer *out)
@@ -1074,10 +1079,16 @@ static int fail_with(lua_State *L, const char *msg)
     return 2;
 }
 
+static bool static_media(Script *s)
+{
+    return s->ext && s->ext->is_static && s->ext->is_static(s->ctx);
+}
+
 /* yagp.clip(name, relpath) -> true | nil, err */
 static int l_clip(lua_State *L)
 {
     Script *s = self(L);
+    if (static_media(s)) return fail_with(L, TXT_U8_STATIC_NO_ANIM);
     const char *name = check_clip_name(L, 1);
     const char *rel = luaL_checkstring(L, 2);
     luaL_argcheck(L, strcmp(name, "main") != 0, 1, TXT_U8_BAD_CLIP_NAME);
@@ -1091,6 +1102,7 @@ static int l_clip(lua_State *L)
 static int l_unload(lua_State *L)
 {
     Script *s = self(L);
+    if (static_media(s)) return fail_with(L, TXT_U8_STATIC_NO_ANIM);
     const char *name = check_clip_name(L, 1);
     if (strcmp(name, "main") != 0 && s->ext && s->ext->unload_clip) s->ext->unload_clip(s->ctx, name);
     return 0;
@@ -1100,6 +1112,10 @@ static int l_unload(lua_State *L)
 static int l_clip_info(lua_State *L)
 {
     Script *s = self(L);
+    if (static_media(s)) {
+        lua_pushnil(L);
+        return 1;
+    }
     const char *name = check_clip_name(L, 1);
     ScriptClipInfo ci;
     memset(&ci, 0, sizeof(ci));
@@ -1140,6 +1156,7 @@ static int anchor_from(lua_State *L, int opts)
 static int l_play(lua_State *L)
 {
     Script *s = self(L);
+    if (static_media(s)) return fail_with(L, TXT_U8_STATIC_NO_ANIM);
     const char *name = check_clip_name(L, 1);
     int opts = lua_isnoneornil(L, 2) ? 0 : 2;
     if (opts) luaL_checktype(L, 2, LUA_TTABLE);
@@ -1177,6 +1194,7 @@ static int l_play(lua_State *L)
 static int l_seek(lua_State *L)
 {
     Script *s = self(L);
+    if (static_media(s)) return fail_with(L, TXT_U8_STATIC_NO_ANIM);
     lua_Integer f = luaL_checkinteger(L, 1);
     luaL_argcheck(L, f >= 1 && f <= 65535, 1, TXT_U8_BAD_RANGE);
     lua_pushboolean(L, s->ext && s->ext->seek && s->ext->seek(s->ctx, (int)f - 1));
@@ -1187,6 +1205,7 @@ static int l_seek(lua_State *L)
 static int l_frame(lua_State *L)
 {
     Script *s = self(L);
+    if (static_media(s)) return fail_with(L, TXT_U8_STATIC_NO_ANIM);
     const char *name = "main";
     int frame = 0, frames = 0;
     if (s->ext && s->ext->get_frame) s->ext->get_frame(s->ctx, &name, &frame, &frames);
@@ -1200,6 +1219,7 @@ static int l_frame(lua_State *L)
 static int l_set_speed(lua_State *L)
 {
     Script *s = self(L);
+    if (static_media(s)) return fail_with(L, TXT_U8_STATIC_NO_ANIM);
     double v = luaL_checknumber(L, 1);
     luaL_argcheck(L, v >= 0.1 && v <= 10, 1, TXT_U8_BAD_RANGE);
     if (s->ext && s->ext->set_speed) s->ext->set_speed(s->ctx, v);
@@ -1209,6 +1229,7 @@ static int l_set_speed(lua_State *L)
 static int l_set_playing(lua_State *L)
 {
     Script *s = self(L);
+    if (static_media(s)) return fail_with(L, TXT_U8_STATIC_NO_ANIM);
     if (s->ext && s->ext->set_playing) s->ext->set_playing(s->ctx, lua_toboolean(L, 1));
     return 0;
 }
@@ -1344,6 +1365,539 @@ static int l_set_clickthrough(lua_State *L)
     return 0;
 }
 
+/* ---- chainable slave handles ---------------------------------------------- */
+
+typedef struct SlaveHandle {
+    int id;
+} SlaveHandle;
+
+#define SLAVE_MT "YAGP_SLAVE"
+#define SLAVE_MAX 64
+
+static const ScriptSlaveOps *slave_api(Script *s)
+{
+    return s && s->ext ? s->ext->slaves : NULL;
+}
+
+static void *slave_target(lua_State *L, Script **out)
+{
+    SlaveHandle *h = (SlaveHandle *)luaL_checkudata(L, 1, SLAVE_MT);
+    Script *s = self(L);
+    *out = s;
+    const ScriptSlaveOps *ops = slave_api(s);
+    return ops && ops->resolve ? ops->resolve(s->ctx, h->id) : NULL;
+}
+
+static int slave_self(lua_State *L)
+{
+    lua_pushvalue(L, 1);
+    return 1;
+}
+
+static int slave_nil(lua_State *L)
+{
+    lua_pushnil(L);
+    return 1;
+}
+
+static bool slave_static_target(lua_State *L, Script *s, void *target)
+{
+    (void)L;
+    const ScriptSlaveOps *ops = slave_api(s);
+    return ops && ops->is_static && ops->is_static(target);
+}
+
+static void push_slave(lua_State *L, int id)
+{
+    SlaveHandle *h = (SlaveHandle *)lua_newuserdatauv(L, sizeof(*h), 0);
+    h->id = id;
+    luaL_setmetatable(L, SLAVE_MT);
+}
+
+static int l_slave(lua_State *L)
+{
+    Script *s = self(L);
+    int id = (int)luaL_checkinteger(L, 1);
+    const ScriptSlaveOps *ops = slave_api(s);
+    if (!ops || !ops->resolve || !ops->resolve(s->ctx, id)) return slave_nil(L);
+    push_slave(L, id);
+    return 1;
+}
+
+static int l_slaves(lua_State *L)
+{
+    Script *s = self(L);
+    const ScriptSlaveOps *ops = slave_api(s);
+    int ids[SLAVE_MAX];
+    int n = ops && ops->list ? ops->list(s->ctx, ids, SLAVE_MAX) : 0;
+    lua_createtable(L, n, 0);
+    for (int i = 0; i < n; ++i) {
+        push_slave(L, ids[i]);
+        lua_rawseti(L, -2, i + 1);
+    }
+    return 1;
+}
+
+static int slave_pos(lua_State *L)
+{
+    Script *s;
+    void *t = slave_target(L, &s);
+    if (!t) return slave_nil(L);
+    double x, y;
+    int w, h;
+    s->ops->get_rect(t, &x, &y, &w, &h);
+    lua_pushnumber(L, x);
+    lua_pushnumber(L, y);
+    return 2;
+}
+
+static int slave_size(lua_State *L)
+{
+    Script *s;
+    void *t = slave_target(L, &s);
+    if (!t) return slave_nil(L);
+    double x, y;
+    int w, h;
+    s->ops->get_rect(t, &x, &y, &w, &h);
+    lua_pushinteger(L, w);
+    lua_pushinteger(L, h);
+    return 2;
+}
+
+static int slave_center(lua_State *L)
+{
+    Script *s;
+    void *t = slave_target(L, &s);
+    if (!t) return slave_nil(L);
+    double x, y;
+    int w, h, dx, dy, hw, hh;
+    s->ops->get_rect(t, &x, &y, &w, &h);
+    s->ops->get_hitbox(t, &dx, &dy, &hw, &hh);
+    lua_pushnumber(L, x + dx + hw / 2.0);
+    lua_pushnumber(L, y + dy + hh / 2.0);
+    return 2;
+}
+
+static int slave_hitbox(lua_State *L)
+{
+    Script *s;
+    void *t = slave_target(L, &s);
+    if (!t) return slave_nil(L);
+    int dx, dy, w, h;
+    s->ops->get_hitbox(t, &dx, &dy, &w, &h);
+    lua_pushinteger(L, dx);
+    lua_pushinteger(L, dy);
+    lua_pushinteger(L, w);
+    lua_pushinteger(L, h);
+    return 4;
+}
+
+static int slave_set_pos(lua_State *L)
+{
+    Script *s;
+    void *t = slave_target(L, &s);
+    double x = check_coord(L, 2), y = check_coord(L, 3);
+    if (t) s->ops->set_pos(t, x, y);
+    return slave_self(L);
+}
+
+static int slave_move(lua_State *L)
+{
+    Script *s;
+    void *t = slave_target(L, &s);
+    double dx = check_coord(L, 2), dy = check_coord(L, 3);
+    if (t) {
+        double x, y;
+        int w, h;
+        s->ops->get_rect(t, &x, &y, &w, &h);
+        s->ops->set_pos(t, x + dx, y + dy);
+    }
+    return slave_self(L);
+}
+
+static int slave_set_flip(lua_State *L)
+{
+    Script *s;
+    void *t = slave_target(L, &s);
+    if (t) s->ops->set_flip(t, lua_toboolean(L, 2));
+    return slave_self(L);
+}
+
+static int slave_set_hitbox(lua_State *L)
+{
+    Script *s;
+    void *t = slave_target(L, &s);
+    if (t && s->ops->set_hitbox) {
+        if (lua_isnoneornil(L, 2)) {
+            s->ops->set_hitbox(t, NULL);
+        } else {
+            lua_Integer v[4];
+            for (int i = 0; i < 4; ++i) v[i] = luaL_checkinteger(L, i + 2);
+            int box[4] = {(int)v[0], (int)v[1], (int)v[2], (int)v[3]};
+            s->ops->set_hitbox(t, box);
+        }
+    }
+    return slave_self(L);
+}
+
+static int slave_name(lua_State *L)
+{
+    SlaveHandle *h = (SlaveHandle *)luaL_checkudata(L, 1, SLAVE_MT);
+    Script *s = self(L);
+    const ScriptSlaveOps *ops = slave_api(s);
+    const char *name = ops && ops->name ? ops->name(s->ctx, h->id) : NULL;
+    if (name) lua_pushstring(L, name);
+    else lua_pushnil(L);
+    return 1;
+}
+
+static int slave_id(lua_State *L)
+{
+    SlaveHandle *h = (SlaveHandle *)luaL_checkudata(L, 1, SLAVE_MT);
+    lua_pushinteger(L, h->id);
+    return 1;
+}
+
+static int slave_paused(lua_State *L)
+{
+    Script *s;
+    void *t = slave_target(L, &s);
+    const ScriptSlaveOps *ops = slave_api(s);
+    if (t && ops && ops->get_paused) lua_pushboolean(L, ops->get_paused(t));
+    else lua_pushnil(L);
+    return 1;
+}
+
+static int slave_hidden(lua_State *L)
+{
+    Script *s;
+    void *t = slave_target(L, &s);
+    const ScriptSlaveOps *ops = slave_api(s);
+    if (t && ops && ops->get_hidden) lua_pushboolean(L, ops->get_hidden(t));
+    else lua_pushnil(L);
+    return 1;
+}
+
+static int slave_hide(lua_State *L)
+{
+    Script *s;
+    void *t = slave_target(L, &s);
+    if (t && s->ext && s->ext->set_hidden) s->ext->set_hidden(t, true);
+    return slave_self(L);
+}
+
+static int slave_show(lua_State *L)
+{
+    Script *s;
+    void *t = slave_target(L, &s);
+    if (t && s->ext && s->ext->set_hidden) s->ext->set_hidden(t, false);
+    return slave_self(L);
+}
+
+static int slave_set_paused(lua_State *L)
+{
+    Script *s;
+    void *t = slave_target(L, &s);
+    if (!t) return slave_self(L);
+    if (slave_static_target(L, s, t)) return fail_with(L, TXT_U8_STATIC_NO_ANIM);
+    if (s->ext && s->ext->set_paused) s->ext->set_paused(t, lua_toboolean(L, 2));
+    return slave_self(L);
+}
+
+static int slave_clip(lua_State *L)
+{
+    Script *s;
+    void *t = slave_target(L, &s);
+    if (!t) return slave_self(L);
+    if (slave_static_target(L, s, t)) return fail_with(L, TXT_U8_STATIC_NO_ANIM);
+    const char *name = check_clip_name(L, 2);
+    const char *rel = luaL_checkstring(L, 3);
+    if (!s->ext || !s->ext->load_clip) return fail_with(L, TXT_U8_UNAVAILABLE);
+    char err[256] = "";
+    if (!s->ext->load_clip(t, name, rel, err, sizeof(err))) return fail_with(L, err);
+    return slave_self(L);
+}
+
+static int slave_unload(lua_State *L)
+{
+    Script *s;
+    void *t = slave_target(L, &s);
+    if (!t) return slave_self(L);
+    if (slave_static_target(L, s, t)) return fail_with(L, TXT_U8_STATIC_NO_ANIM);
+    const char *name = check_clip_name(L, 2);
+    if (s->ext && s->ext->unload_clip) s->ext->unload_clip(t, name);
+    return slave_self(L);
+}
+
+static int slave_play(lua_State *L)
+{
+    Script *s;
+    void *t = slave_target(L, &s);
+    if (!t) return slave_self(L);
+    if (slave_static_target(L, s, t)) return fail_with(L, TXT_U8_STATIC_NO_ANIM);
+    const char *name = check_clip_name(L, 2);
+    int opts = lua_isnoneornil(L, 3) ? 0 : 3;
+    if (opts) luaL_checktype(L, opts, LUA_TTABLE);
+    ScriptPlay p;
+    p.from = (int)opt_number(L, opts, "from", 1, 65535, 0) - 1;
+    p.to = (int)opt_number(L, opts, "to", 1, 65535, 0) - 1;
+    if (p.from >= 0 && p.to >= 0) luaL_argcheck(L, p.from <= p.to, opts, TXT_U8_BAD_RANGE);
+    p.loops = -1;
+    if (opts) {
+        int k = lua_getfield(L, opts, "loop");
+        if (k == LUA_TBOOLEAN) p.loops = lua_toboolean(L, -1) ? -1 : 1;
+        else if (k == LUA_TNUMBER) {
+            lua_Integer n = lua_tointeger(L, -1);
+            if (n < 1 || n > 1000000) return luaL_error(L, TXT_U8_BAD_OPTION, "loop");
+            p.loops = (int)n;
+        } else if (k != LUA_TNIL) return luaL_error(L, TXT_U8_BAD_OPTION, "loop");
+        lua_pop(L, 1);
+    }
+    p.speed = opt_number(L, opts, "speed", 0.1, 10, 1);
+    p.anchor = anchor_from(L, opts);
+    p.sync = opts && get_bool(L, opts, "sync");
+    p.restart = true;
+    if (opts) {
+        lua_getfield(L, opts, "restart");
+        if (!lua_isnil(L, -1)) p.restart = lua_toboolean(L, -1);
+        lua_pop(L, 1);
+    }
+    char err[256] = "";
+    if (!s->ext || !s->ext->play) return fail_with(L, TXT_U8_UNAVAILABLE);
+    if (!s->ext->play(t, name, &p, err, sizeof(err))) return fail_with(L, err);
+    return slave_self(L);
+}
+
+static int slave_seek(lua_State *L)
+{
+    Script *s;
+    void *t = slave_target(L, &s);
+    if (!t) return slave_self(L);
+    if (slave_static_target(L, s, t)) return fail_with(L, TXT_U8_STATIC_NO_ANIM);
+    lua_Integer f = luaL_checkinteger(L, 2);
+    luaL_argcheck(L, f >= 1 && f <= 65535, 2, TXT_U8_BAD_RANGE);
+    if (!s->ext || !s->ext->seek || !s->ext->seek(t, (int)f - 1))
+        return fail_with(L, TXT_U8_BAD_RANGE);
+    return slave_self(L);
+}
+
+static int slave_frame(lua_State *L)
+{
+    Script *s;
+    void *t = slave_target(L, &s);
+    if (!t) return slave_nil(L);
+    if (slave_static_target(L, s, t)) return fail_with(L, TXT_U8_STATIC_NO_ANIM);
+    const char *name = "main";
+    int frame = 0, frames = 0;
+    if (s->ext && s->ext->get_frame) s->ext->get_frame(t, &name, &frame, &frames);
+    lua_pushstring(L, name ? name : "main");
+    lua_pushinteger(L, frame + 1);
+    if (frames > 0) lua_pushinteger(L, frames);
+    else lua_pushnil(L);
+    return 3;
+}
+
+static int slave_clip_info(lua_State *L)
+{
+    Script *s;
+    void *t = slave_target(L, &s);
+    if (!t) return slave_nil(L);
+    if (slave_static_target(L, s, t)) return slave_nil(L);
+    const char *name = check_clip_name(L, 2);
+    ScriptClipInfo ci;
+    memset(&ci, 0, sizeof(ci));
+    if (!s->ext || !s->ext->clip_info || !s->ext->clip_info(t, name, &ci)) return slave_nil(L);
+    lua_createtable(L, 0, 6);
+    int tab = lua_gettop(L);
+    set_int(L, tab, "w", ci.w);
+    set_int(L, tab, "h", ci.h);
+    set_bool(L, tab, "ready", ci.frames > 0);
+    if (ci.frames > 0) {
+        set_int(L, tab, "frames", ci.frames);
+        set_num(L, tab, "duration", ci.duration);
+        if (ci.delays) {
+            lua_createtable(L, ci.frames, 0);
+            for (int i = 0; i < ci.frames; ++i) {
+                lua_pushnumber(L, ci.delays[i] / 1000.0);
+                lua_rawseti(L, -2, i + 1);
+            }
+            lua_setfield(L, tab, "delays");
+        }
+    }
+    return 1;
+}
+
+static int slave_set_speed(lua_State *L)
+{
+    Script *s;
+    void *t = slave_target(L, &s);
+    if (!t) return slave_self(L);
+    if (slave_static_target(L, s, t)) return fail_with(L, TXT_U8_STATIC_NO_ANIM);
+    double v = luaL_checknumber(L, 2);
+    luaL_argcheck(L, v >= 0.1 && v <= 10, 2, TXT_U8_BAD_RANGE);
+    if (s->ext && s->ext->set_speed) s->ext->set_speed(t, v);
+    return slave_self(L);
+}
+
+static int slave_set_playing(lua_State *L)
+{
+    Script *s;
+    void *t = slave_target(L, &s);
+    if (!t) return slave_self(L);
+    if (slave_static_target(L, s, t)) return fail_with(L, TXT_U8_STATIC_NO_ANIM);
+    if (s->ext && s->ext->set_playing) s->ext->set_playing(t, lua_toboolean(L, 2));
+    return slave_self(L);
+}
+
+static int slave_set_matrix(lua_State *L)
+{
+    Script *s;
+    void *t = slave_target(L, &s);
+    if (!t) return slave_self(L);
+    double m[6];
+    for (int i = 0; i < 6; ++i) m[i] = luaL_checknumber(L, i + 2);
+    check_matrix(L, m);
+    double duration = check_duration(L, 8);
+    int easing = easing_from(L, 9);
+    if (!s->ext || !s->ext->set_matrix || !s->ext->set_matrix(t, m, duration, easing))
+        luaL_error(L, TXT_U8_BAD_MATRIX);
+    return slave_self(L);
+}
+
+static int slave_set_transform(lua_State *L)
+{
+    const double rad = 3.14159265358979323846 / 180.0;
+    Script *s;
+    void *t = slave_target(L, &s);
+    luaL_checktype(L, 2, LUA_TTABLE);
+    if (!t) return slave_self(L);
+    double sx = opt_number(L, 2, "sx", -8, 8, 1), sy = opt_number(L, 2, "sy", -8, 8, 1);
+    double a = opt_number(L, 2, "angle", -3600, 3600, 0) * rad;
+    double tkx = tan(opt_number(L, 2, "kx", -80, 80, 0) * rad);
+    double tky = tan(opt_number(L, 2, "ky", -80, 80, 0) * rad);
+    double tx = opt_number(L, 2, "tx", -4096, 4096, 0), ty = opt_number(L, 2, "ty", -4096, 4096, 0);
+    double x, y;
+    int w, h;
+    s->ops->get_rect(t, &x, &y, &w, &h);
+    double gw = w, gh = h;
+    const char *cur = NULL;
+    int frame = 0, frames = 0;
+    ScriptClipInfo ci;
+    if (s->ext && s->ext->get_frame && s->ext->clip_info) {
+        s->ext->get_frame(t, &cur, &frame, &frames);
+        if (cur && s->ext->clip_info(t, cur, &ci) && ci.w > 0 && ci.h > 0) {
+            gw = ci.w;
+            gh = ci.h;
+        }
+    }
+    double cx = opt_number(L, 2, "px", -65535, 65535, gw / 2) * w / gw;
+    double cy = opt_number(L, 2, "py", -65535, 65535, gh) * h / gh;
+    double ca = cos(a), sa = sin(a);
+    double k11 = sx, k12 = sx * tky, k21 = sy * tkx, k22 = sy;
+    double m[6];
+    m[0] = k11 * ca - k12 * sa;
+    m[1] = k11 * sa + k12 * ca;
+    m[2] = k21 * ca - k22 * sa;
+    m[3] = k21 * sa + k22 * ca;
+    m[4] = cx + tx - cx * m[0] - cy * m[2];
+    m[5] = cy + ty - cx * m[1] - cy * m[3];
+    double duration = opt_number(L, 2, "duration", 0, 60, 0);
+    int easing = SEASE_OUT;
+    if (opt_string(L, 2, "easing")) easing = easing_from(L, lua_gettop(L));
+    check_matrix(L, m);
+    if (!s->ext || !s->ext->set_matrix || !s->ext->set_matrix(t, m, duration, easing))
+        luaL_error(L, TXT_U8_BAD_MATRIX);
+    return slave_self(L);
+}
+
+static int slave_reset_transform(lua_State *L)
+{
+    Script *s;
+    void *t = slave_target(L, &s);
+    if (!t) return slave_self(L);
+    static const double identity[6] = {1, 0, 0, 1, 0, 0};
+    double d = check_duration(L, 2);
+    if (s->ext && s->ext->set_matrix) s->ext->set_matrix(t, d > 0 ? identity : NULL, d, SEASE_OUT);
+    return slave_self(L);
+}
+
+static int slave_set_opacity(lua_State *L)
+{
+    Script *s;
+    void *t = slave_target(L, &s);
+    if (!t) return slave_self(L);
+    double a = luaL_checknumber(L, 2);
+    luaL_argcheck(L, a >= 0 && a <= 1, 2, TXT_U8_BAD_RANGE);
+    double d = check_duration(L, 3);
+    int easing = easing_from(L, 4);
+    if (s->ext && s->ext->set_opacity) s->ext->set_opacity(t, a, d, easing);
+    return slave_self(L);
+}
+
+static int slave_set_cursor(lua_State *L)
+{
+    Script *s;
+    void *t = slave_target(L, &s);
+    if (!t) return slave_self(L);
+    static const char *const names[] = {"move", "arrow", "hand", "none", NULL};
+    int shape = luaL_checkoption(L, 2, NULL, names);
+    if (s->ext && s->ext->set_cursor) s->ext->set_cursor(t, shape);
+    return slave_self(L);
+}
+
+static int slave_set_draggable(lua_State *L)
+{
+    Script *s;
+    void *t = slave_target(L, &s);
+    if (t && s->ext && s->ext->set_draggable) s->ext->set_draggable(t, lua_toboolean(L, 2));
+    return slave_self(L);
+}
+
+static int slave_set_clickthrough(lua_State *L)
+{
+    Script *s;
+    void *t = slave_target(L, &s);
+    if (t && s->ext && s->ext->set_clickthrough) s->ext->set_clickthrough(t, lua_toboolean(L, 2));
+    return slave_self(L);
+}
+
+static int slave_tostring(lua_State *L)
+{
+    SlaveHandle *h = (SlaveHandle *)luaL_checkudata(L, 1, SLAVE_MT);
+    lua_pushfstring(L, "slave#%d", h->id);
+    return 1;
+}
+
+static const luaL_Reg slave_methods[] = {
+    {"pos", slave_pos}, {"size", slave_size}, {"center", slave_center}, {"hitbox", slave_hitbox},
+    {"name", slave_name}, {"id", slave_id}, {"paused", slave_paused}, {"hidden", slave_hidden},
+    {"set_pos", slave_set_pos}, {"move", slave_move}, {"set_flip", slave_set_flip},
+    {"set_hitbox", slave_set_hitbox}, {"clip", slave_clip}, {"unload", slave_unload},
+    {"play", slave_play}, {"seek", slave_seek}, {"frame", slave_frame},
+    {"clip_info", slave_clip_info}, {"set_speed", slave_set_speed},
+    {"set_playing", slave_set_playing}, {"set_paused", slave_set_paused},
+    {"set_matrix", slave_set_matrix}, {"set_transform", slave_set_transform},
+    {"reset_transform", slave_reset_transform}, {"set_opacity", slave_set_opacity},
+    {"set_cursor", slave_set_cursor}, {"set_draggable", slave_set_draggable},
+    {"set_clickthrough", slave_set_clickthrough}, {"hide", slave_hide}, {"show", slave_show},
+    {NULL, NULL}
+};
+
+static int slave_index(lua_State *L)
+{
+    luaL_checkudata(L, 1, SLAVE_MT);
+    const char *name = luaL_checkstring(L, 2);
+    for (const luaL_Reg *r = slave_methods; r->name; ++r) {
+        if (strcmp(r->name, name) == 0) {
+            lua_pushcfunction(L, r->func);
+            return 1;
+        }
+    }
+    lua_pushnil(L);
+    return 1;
+}
+
+
 static const luaL_Reg yagp_lib[] = {
     {"pos", l_pos},         {"set_pos", l_set_pos}, {"move", l_move},
     {"size", l_size},       {"monitors", l_monitors}, {"monitor", l_monitor},
@@ -1362,6 +1916,7 @@ static const luaL_Reg yagp_lib[] = {
     {"reset_transform", l_reset_transform}, {"set_opacity", l_set_opacity},
     {"set_cursor", l_set_cursor}, {"set_draggable", l_set_draggable},
     {"set_clickthrough", l_set_clickthrough}, {"notify", l_notify},
+    {"slave", l_slave}, {"slaves", l_slaves},
     {NULL, NULL}
 };
 
@@ -1749,6 +2304,12 @@ static int open_sandbox(lua_State *L)
     lua_setglobal(L, "print");
     luaL_newlib(L, log_lib);
     lua_setglobal(L, "log");
+    luaL_newmetatable(L, SLAVE_MT);
+    lua_pushcfunction(L, slave_index);
+    lua_setfield(L, -2, "__index");
+    lua_pushcfunction(L, slave_tostring);
+    lua_setfield(L, -2, "__tostring");
+    lua_pop(L, 1);
     lua_getglobal(L, "setmetatable");
     lua_pushcclosure(L, l_setmetatable, 1);
     lua_setglobal(L, "setmetatable");

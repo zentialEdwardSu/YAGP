@@ -23,13 +23,15 @@ and rxi/log.c (all MIT) are pulled in by `FetchContent` at configure time
 (SHA-256 pinned; log.c is pinned to commit `f9ea349`). For offline builds pass
 `-DFETCHCONTENT_SOURCE_DIR_GIFLIB=<dir>`,
 `-DFETCHCONTENT_SOURCE_DIR_LUA=<dir>` and
-`-DFETCHCONTENT_SOURCE_DIR_RXILOG=<dir containing src/log.c>`.
+`-DFETCHCONTENT_SOURCE_DIR_RXILOG=<dir containing src/log.c>`. stb_image v2.30
+is vendored as `third_party/stb_image.h` (MIT/public domain) and needs no
+download.
 
 From any shell (no VS developer prompt needed):
 
 ```powershell
 cmake --preset release            # Visual Studio generator, x64, into out\
-cmake --build --preset release    # yagp, script_test, log_test, gif_dump
+cmake --build --preset release    # yagp, script_test, log_test, gif_dump, image_dump, group_test, config_test
 .\out\Release\yagp.exe [file.gif ...]
 ```
 
@@ -61,11 +63,33 @@ python tools/make_icon.py    # needs Pillow; edit RADIUS in the script to change
 
 ## Usage
 
-- Tray icon (left or right click): add GIFs (multi-select), a per-GIF submenu,
-  pause/resume all, start with Windows, delete settings data, exit.
-  GIFs with a motion script are tagged "(moving)" in the tray menu.
-- Right-click a GIF (or its tray submenu): hide/show, plus pause/resume, replace, scale, colour key, motion script,
-  always on top, lock position, click-through, move to screen centre, remove.
+- Tray icon (left or right click): add media (GIF/PNG/JPG, multi-select), a
+  per-media submenu, groups, pause/resume all, start with Windows, delete
+  settings data, exit. Media with a motion script are tagged "(moving)".
+- Right-click media (or its tray submenu): hide/show, plus pause/resume, replace,
+  scale, colour key, motion script, master/slave relation, always on top, lock
+  position, click-through, move to screen centre, remove.
+- Images: add/replace/group import accept `.png`, `.jpg`, `.jpeg`. PNG alpha is
+  preserved; JPEG is opaque. Still images have no animation: pause/resume,
+  seek, clip and speed controls are unavailable, but movement, scale,
+  transforms, opacity, colour key, scripts, hiding and master/slave control
+  remain available. APNG is shown as its first frame; animated WebP/AVIF is not
+  supported.
+- Groups: tray "Groups → Import group…" picks a folder and recursively scans
+  for same-directory, same-stem media + `.lua` pairs (`pet.gif` + `pet.lua`,
+  `cat.png` + `cat.lua`). Unpaired media are treated as clip assets. Each group
+  gets a tray submenu with hide/show and remove; group hiding does not overwrite
+  members' own hidden flags.
+- Master/slave: right-click media → "Belongs to…" to choose one master. A
+  master may have multiple slaves, only one level is allowed and cycles are
+  rejected. A slave's script is stopped but its binding is preserved; unlinking
+  or removing the master restores it. The master script controls slaves through
+  the chainable `yagp.slaves()` / `yagp.slave(id)` handles.
+- Hide takes media off the screen without removing it. It stays in the tray
+  menu (tagged "(hidden)"); "Show" in its submenu brings it back with the same
+  position, scale, colour key and script. While hidden it does not animate or
+  run its script, other scripts do not see it, and its swap chain and canvas
+  are freed. The hidden state is saved across restarts.
 - Scale: a slider from 5% to 250% with live preview. You can also type a value
   or use the 100% button. Arrow keys move 1%, PgUp/PgDn 25%. Cancel restores
   the previous size. The GIF stays centred on the same point while scaling.
@@ -74,20 +98,16 @@ python tools/make_icon.py    # needs Pillow; edit RADIUS in the script to change
   Matching pixels are made transparent during compositing.
 - Drag a GIF with the left mouse button unless it is locked.
 - A click-through GIF ignores the mouse; turn it off from the tray submenu.
-- Hide takes a GIF off the screen without removing it. It stays in the tray
-  menu (tagged "(hidden)"); "Show" in its submenu brings it back with the same
-  position, scale, colour key and script. While hidden it does not animate or
-  run its script, other scripts do not see it, and its swap chain and canvas
-  are freed. The hidden state is saved across restarts.
 - Running `yagp.exe file.gif` again adds the file to the running instance.
 - "Start with Windows" writes `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\YAGP`
   (per-user, no admin rights). It shows as checked only if the entry points at
   the running exe. Startup is silent: no notification is shown.
 - State is saved to `%APPDATA%\YAGP\config.txt` (1 s debounce, and on exit),
-  including each GIF's script binding. "Delete settings data" removes
-  `%APPDATA%\YAGP`, the frame cache in `%LOCALAPPDATA%\YAGP` and the startup
-  entry; after that nothing is saved until the next launch. Your own `.lua`
-  files are never touched.
+  including each media's script binding, groups and master/slave relations. The
+  format is v4; older v1-v3 files are read automatically. "Delete settings data"
+  removes `%APPDATA%\YAGP`, the frame cache in `%LOCALAPPDATA%\YAGP` and the
+  startup entry; after that nothing is saved until the next launch. Your own
+  `.lua` files are never touched.
 - "Enable logging…" asks for a folder and appends to
   `<folder>\yagp-YYYYMMDD.log`. Clicking "Stop logging" writes a final line and
   closes the file. The switch and the folder are per run and are never saved;
@@ -100,7 +120,7 @@ python tools/make_icon.py    # needs Pillow; edit RADIUS in the script to change
 
 ```powershell
 .\out\Release\yagp.exe --verbose
-.\out\Release\yagp.exe -v .\example\main.gif
+.\out\Release\yagp.exe -v .\example\legacy-demo\main.gif
 .\out\Release\yagp.exe --verbose > yagp.log 2> yagp.err
 ```
 
@@ -117,6 +137,18 @@ Redirected output is UTF-8; a console is written with `WriteConsoleW`.
 - `--verbose` does not change the tray logging switch or the config; both can be
   used together. Closing the terminal or Ctrl+C may end the attached process.
 - The `--pick` helper produces no terminal output.
+
+## Examples
+
+`example/` contains standalone demos for the new features:
+
+- `example/image/`: PNG/JPG still images, alpha/hitbox, movement/transforms,
+  disabled playback controls
+- `example/master-slave/`: chainable master/slave control (manual menu binding)
+- `example/group/`: group import, group hide/show/remove, individual-vs-group
+  hiding
+
+See [example/README.md](example/README.md).
 
 ## Motion scripts
 
@@ -188,14 +220,28 @@ above the primary monitor). Positions refer to the window's top-left corner.
 | `yagp.set_rate(hz)` | `update` calls per second, 1-144, default 60 |
 | `yagp.name` | GIF file name |
 | `yagp.id` | This GIF's id, unique for this run (changes on restart) |
-| `yagp.others()` | Every other GIF: `{ {id, name, x, y, w, h, hx, hy, hw, hh, cx, cy, vx, vy, scripted, paused}, ... }`, including ones without a script and paused ones. `x, y, w, h` is the window, `hx, hy, hw, hh` the visible area, `cx, cy` its centre. `vx`, `vy` are px/s over its last tick, 0 when not moving |
+| `yagp.others()` | Every other media: `{ {id, name, x, y, w, h, hx, hy, hw, hh, cx, cy, vx, vy, scripted, paused, still, controlled, master, master_id}, ... }`, including ones without a script and paused ones. `x, y, w, h` is the window, `hx, hy, hw, hh` the visible area, `cx, cy` its centre. `vx`, `vy` are px/s over its last tick, 0 when not moving. `still` marks images, `controlled` marks slaves, `master` marks overlays with slaves |
 | `yagp.peer(id)` | One GIF's peer table, or nil |
 | `yagp.overlaps([x, y [, w, h]])` | Other GIFs whose visible area overlaps this GIF's. No arguments: where it is now; x, y: with the window moved there; explicit w, h: that rect at x, y. Sharing an edge is not an overlap |
 | `log.trace(...)`, `log.debug(...)`, `log.info(...)`, `log.warn(...)`, `log.error(...)`, `log.fatal(...)` | Write a log line tagged `script <name>#<id>`. Arguments are converted without metamethods and joined with tabs; long messages keep 1024 bytes and a `...` marker. At most 100 lines per second per script; the excess is dropped and summarised |
 | `yagp.notify(text)`, `yagp.notify(title, text)` | Show a tray balloon (default title `YAGP`). Returns `true` if it was shown, `false` when throttled (at most one per 3 s per script) or unavailable. Values are converted like `log.*`; the tray field limits are applied |
+| `yagp.slaves()` | Array of chainable handles for this overlay's direct slaves; empty when it is not a master |
+| `yagp.slave(id)` | Handle for one direct slave, or nil |
+| `slave:pos()`, `size()`, `center()`, `hitbox()`, `frame()`, `clip_info(name)`, `name()`, `id()`, `paused()`, `hidden()` | Query slave state; nil after the slave is gone |
+| `slave:set_pos(...)`, `move(...)`, `set_flip(...)`, `set_hitbox(...)` | Move/flip/hitbox; returns the same handle |
+| `slave:clip(...)`, `unload(...)`, `play(...)`, `seek(...)`, `set_speed(...)`, `set_playing(...)`, `set_paused(...)` | Slave GIF playback; returns the handle, or nil, err on failure. On still images these return "no animation" |
+| `slave:set_matrix(...)`, `set_transform(...)`, `reset_transform(...)`, `set_opacity(...)` | Slave transform/opacity; returns the handle |
+| `slave:set_cursor(...)`, `set_draggable(...)`, `set_clickthrough(...)`, `hide()`, `show()` | Slave input/visibility; returns the handle |
 
-Other GIFs are read-only: a script cannot move them or message them.
-A script sees at most 64 other GIFs.
+A slave's own script is stopped; the master cannot remove slaves, replace their
+files, change their script binding or change the relation. Chain example:
+
+```lua
+yagp.slave(id):set_pos(x, y):set_flip(true):play("walk", {loop = true}):set_opacity(0.5, 0.2)
+```
+
+Other overlays are read-only; only overlays bound as this master's slaves can be
+controlled. A script sees at most 64 other overlays.
 
 **Visible area (hitbox).** Edges and collisions use the GIF's visible area,
 not its whole window: the bounding box of every non-transparent pixel over all
@@ -360,9 +406,17 @@ After `cmake --build --preset release`:
 ```powershell
 python tests/test_gif_stream.py out\Release\gif_dump.exe   # needs Pillow
 python tests/test_frame_cache.py out\Release\gif_dump.exe
+python tests/test_still_image.py out\Release\image_dump.exe
+out\Release\group_test.exe
+out\Release\config_test.exe
 out\Release\script_test.exe
 out\Release\log_test.exe
 ```
+
+The still-image test generates PNG/JPEG fixtures with Pillow and covers alpha,
+colour key, hitbox, JPEG decoding, corrupt files and oversized-image rejection;
+`script_test` covers chainable slave handles, safe invalidation after deletion
+and rejection of animation calls on still slaves.
 
 The decoder test compares composited frames and delays against Pillow,
 covering disposal 1/2/3, interlacing, looping via `gif_stream_restart`, colour
@@ -409,6 +463,15 @@ the user's profile.
   path) and its fixed wording is English; paths and messages keep their bytes.
 - Terminal output requires `--verbose`/`-v`; hosts without a console (Explorer,
   some Git Bash/pty setups) only get redirected handles or DebugView.
+- Still images have no animation; APNG shows its first frame and animated
+  WebP/AVIF is not supported. Image decoding runs on the UI thread and is
+  bounded by a 64M-pixel budget.
+- Groups import only same-directory, same-stem media + `.lua` pairs; unpaired
+  media are treated as clip assets. There is no tab window and no manual
+  member rename/add/remove.
+- Master/slave is one level only: a slave cannot be a master and a master cannot
+  become a slave. A slave's script stays stopped while bound and resumes after
+  unlinking or when its master is removed.
 
 ## License
 
@@ -422,6 +485,7 @@ text.
 | [giflib](https://giflib.sourceforge.net/) | 5.2.2 | MIT (Copyright (c) 1997 Eric S. Raymond) | GIF/LZW decoding |
 | [Lua](https://www.lua.org/) | 5.4.7 | MIT (Copyright (c) 1994-2024 Lua.org, PUC-Rio) | Sandboxed scripting runtime; the `lstrlib.c` pattern-work patch remains under the Lua license |
 | [rxi/log.c](https://github.com/rxi/log.c) | commit `f9ea349` | MIT (Copyright (c) 2020 rxi) | Logging core |
+| [stb_image](https://github.com/nothings/stb) | v2.30 (`third_party/stb_image.h`) | MIT / public domain (MIT chosen) | PNG/JPG/JPEG decoding |
 
 The complete third-party license texts are in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). CMake, Python, Pillow and

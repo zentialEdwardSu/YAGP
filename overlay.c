@@ -1,4 +1,5 @@
 #include "overlay.h"
+#include "group.h"
 #include "app.h"
 #include "applog.h"
 #include "clip_path.h"
@@ -85,15 +86,20 @@ static bool effective_clickthrough(const Overlay *o)
     return o->ct_override >= 0 ? o->ct_override != 0 : o->clickthrough;
 }
 
+static bool overlay_effective_hidden(const Overlay *o)
+{
+    return o->hidden || (o->group && o->group->hidden);
+}
+
 static bool script_live(const Overlay *o)
 {
-    return o->script && !o->hidden && !o->paused && !o->scaling;
+    return o->script && !o->master && !overlay_effective_hidden(o) && !o->paused && !o->scaling;
 }
 
 bool overlay_is_animating(const Overlay *o)
 {
-    return o->surface && !o->hidden && !o->paused && !o->failed && !o->is_static && o->play.playing &&
-           !o->play.held;
+    return o->surface && !overlay_effective_hidden(o) && !o->paused && !o->failed && !o->is_static &&
+           o->play.playing && !o->play.held;
 }
 
 static ClipKey overlay_key(const Overlay *o)
@@ -221,7 +227,7 @@ static void apply_geometry(Overlay *o)
 
 bool overlay_attach_surface(Overlay *o)
 {
-    if (o->surface || o->hidden) return true; /* A hidden GIF gets its swap chain when shown. */
+    if (o->surface || overlay_effective_hidden(o)) return true; /* A hidden GIF gets its swap chain when shown. */
     const GifStream *g = cur_gif(o);
     o->surface = render_surface_create(g_app.device, o->hwnd, g->out_w, g->out_h);
     if (!o->surface) return false;
@@ -399,8 +405,8 @@ static void advance(Overlay *o, int64_t now)
 static void reset_timing(Overlay *o)
 {
     o->failed = false;
-    o->is_static = false;
-    o->next_frame = app_now() + delay_ticks(o);
+    o->is_static = o->still_image;
+    o->next_frame = o->still_image ? INT64_MAX : app_now() + delay_ticks(o);
 }
 
 /* Shows clip index ci from frame `from` (0-based), resizing the layout box
@@ -687,6 +693,10 @@ static void fill_peer(const Overlay *o, ScriptPeer *p)
     p->vy = moving ? o->vy : 0;
     p->scripted = o->script != NULL;
     p->paused = o->paused;
+    p->still = o->still_image;
+    p->controlled = o->master != NULL;
+    p->master = overlay_has_slaves(o);
+    p->master_id = o->master ? o->master->id : 0;
     p->name = o->name_u8 ? o->name_u8 : "";
 }
 
@@ -695,7 +705,7 @@ static int host_get_peers(void *ctx, ScriptPeer *out, int cap)
     if (s_peer_n < 0) {
         s_peer_n = 0;
         for (Overlay *o = g_app.overlays; o && s_peer_n < SCRIPT_MAX_PEERS + 1; o = o->next) {
-            if (o->hidden) continue;
+            if (overlay_effective_hidden(o)) continue;
             s_peer_owner[s_peer_n] = o;
             fill_peer(o, &s_peer_cache[s_peer_n++]);
         }
@@ -710,7 +720,40 @@ static int host_get_peers(void *ctx, ScriptPeer *out, int cap)
 static const ScriptHostOps HOST_OPS = {host_get_rect, host_set_pos, host_set_flip, host_set_rate,
                                        host_get_mouse, host_get_peers, host_get_hitbox, host_set_hitbox};
 
+static Overlay *find_overlay(int id);
+
+static int slave_list(void *ctx, int *ids, int cap)
+{
+    Overlay *master = (Overlay *)ctx;
+    int n = 0;
+    for (Overlay *o = g_app.overlays; o && n < cap; o = o->next) {
+        if (o->master == master) ids[n++] = o->id;
+    }
+    return n;
+}
+
+static void *slave_resolve(void *ctx, int id)
+{
+    Overlay *o = find_overlay(id);
+    return o && o->master == (Overlay *)ctx ? o : NULL;
+}
+
+static const char *slave_name(void *ctx, int id)
+{
+    Overlay *o = (Overlay *)slave_resolve(ctx, id);
+    return o ? (o->name_u8 ? o->name_u8 : "") : NULL;
+}
+
+static bool slave_hidden(void *target) { return ((Overlay *)target)->hidden; }
+static bool slave_paused(void *target) { return ((Overlay *)target)->paused; }
+static bool slave_static(void *target) { return ((Overlay *)target)->still_image; }
+
+static const ScriptSlaveOps SLAVE_OPS = {slave_list, slave_resolve, slave_name,
+                                         slave_hidden, slave_paused, slave_static};
+
 /* ---- extended host ops: clips, playback, composition, input behaviour ---- */
+
+static void reset_tick(Overlay *o);
 
 static bool xhost_load_clip(void *ctx, const char *name, const char *rel, char *err, size_t cap)
 {
@@ -729,6 +772,11 @@ static bool xhost_load_clip(void *ctx, const char *name, const char *rel, char *
     ClipKey key = overlay_key(o);
     if (!clip_open(&c, name, path, &key, o->scale_pct, true)) {
         strncpy_s(err, cap, TXT_U8_CLIP_OPEN, _TRUNCATE);
+        return false;
+    }
+    if (c.gif->is_still) {
+        clip_close(&c);
+        strncpy_s(err, cap, TXT_U8_STATIC_NO_ANIM, _TRUNCATE);
         return false;
     }
     if (at < 0) {
@@ -980,10 +1028,33 @@ static double xhost_now(void *ctx)
     return app_seconds();
 }
 
+static bool xhost_is_static(void *ctx)
+{
+    return ((Overlay *)ctx)->still_image;
+}
+
+static void xhost_set_hidden(void *ctx, bool hidden)
+{
+    overlay_set_hidden((Overlay *)ctx, hidden);
+    app_changed();
+}
+
+static void xhost_set_paused(void *ctx, bool paused)
+{
+    Overlay *o = (Overlay *)ctx;
+    if (o->still_image || o->paused == paused) return;
+    o->paused = paused;
+    if (!paused) o->next_frame = app_now();
+    reset_tick(o);
+    overlay_refresh_hook();
+    app_changed();
+}
+
 static const ScriptHostExtOps HOST_EXT = {
     xhost_load_clip, xhost_unload_clip, xhost_clip_info, xhost_play, xhost_seek, xhost_get_frame,
     xhost_set_speed, xhost_set_playing, xhost_set_matrix, xhost_set_opacity, xhost_set_cursor,
     xhost_set_draggable, xhost_set_clickthrough, xhost_subs_changed, xhost_now, xhost_notify,
+    xhost_is_static, xhost_set_hidden, xhost_set_paused, &SLAVE_OPS,
 };
 
 /* ---- script lifecycle and calls -------------------------------------------- */
@@ -1019,7 +1090,7 @@ static void reset_script_state(Overlay *o)
     p->speed = 1.0;
     p->held = false;
     p->playing = true;
-    if (restart && !o->hidden) {
+    if (restart && !overlay_effective_hidden(o)) {
         GifStream *g = cur_gif(o);
         if (gif_stream_restart(g) == 0 && gif_stream_next(g) == 1) {
             p->frame = 0;
@@ -1122,6 +1193,16 @@ void overlay_set_script(Overlay *o, const wchar_t *spec)
     o->script_failed = false;
     free(o->script_spec);
     o->script_spec = copy;
+    if (o->master) {
+        /* A slave's own script stays dormant; only the master may control it. */
+        script_destroy(o->script);
+        o->script = NULL;
+        o->subs = 0;
+        o->script_failed = false;
+        o->next_timer = INT64_MAX;
+        overlay_refresh_hook();
+        return;
+    }
     reset_script_state(o);
     o->tick_interval = g_app.qpc_freq / SCRIPT_RATE_DEFAULT;
     if (!*copy) {
@@ -1166,6 +1247,81 @@ void overlay_set_script(Overlay *o, const wchar_t *spec)
     }
     overlay_refresh_hook();
     app_reschedule();
+}
+
+bool overlay_has_slaves(const Overlay *o)
+{
+    if (!o) return false;
+    for (const Overlay *q = g_app.overlays; q; q = q->next) {
+        if (q->master == o) return true;
+    }
+    return false;
+}
+
+bool overlay_bind_master(Overlay *slave, Overlay *master, wchar_t *err, size_t cap)
+{
+    if (err && cap) err[0] = 0;
+    if (!slave || !master || slave == master) {
+        if (err) _snwprintf_s(err, cap, _TRUNCATE, TXT_MASTER_CYCLE);
+        return false;
+    }
+    if (slave->master == master) return true;
+    if (master->master) {
+        if (err) _snwprintf_s(err, cap, _TRUNCATE, TXT_MASTER_CHAIN_ERROR);
+        return false;
+    }
+    if (overlay_has_slaves(slave)) {
+        if (err) _snwprintf_s(err, cap, _TRUNCATE, TXT_MASTER_CHAIN_ERROR);
+        return false;
+    }
+    for (Overlay *m = master; m; m = m->master) {
+        if (m == slave) {
+            if (err) _snwprintf_s(err, cap, _TRUNCATE, TXT_MASTER_CYCLE);
+            return false;
+        }
+    }
+    script_destroy(slave->script);
+    slave->script = NULL;
+    slave->subs = 0;
+    slave->script_failed = false;
+    slave->next_timer = INT64_MAX;
+    slave->master = master;
+    peers_changed();
+    overlay_refresh_hook();
+    app_changed();
+    char u8[MAX_PATH * 4];
+    log_info("GIF #%d is now controlled by #%d (%s)", slave->id, master->id,
+             applog_u8(overlay_name(master), u8, sizeof(u8)));
+    return true;
+}
+
+void overlay_unbind_master(Overlay *slave, bool reload_script)
+{
+    if (!slave || !slave->master) return;
+    slave->master = NULL;
+    if (reload_script && slave->script_spec && *slave->script_spec)
+        overlay_set_script(slave, slave->script_spec);
+    peers_changed();
+    overlay_refresh_hook();
+    app_changed();
+}
+
+void overlay_master_removed(Overlay *master)
+{
+    if (!master) return;
+    bool changed = false;
+    for (Overlay *o = g_app.overlays; o; o = o->next) {
+        if (o->master != master) continue;
+        o->master = NULL;
+        changed = true;
+        if (!g_app.shutting_down && o->script_spec && *o->script_spec)
+            overlay_set_script(o, o->script_spec);
+    }
+    if (changed) {
+        peers_changed();
+        overlay_refresh_hook();
+        app_changed();
+    }
 }
 
 bool overlay_is_moving(const Overlay *o)
@@ -1237,15 +1393,14 @@ void overlay_screens_changed(Overlay *o)
     deliver_plain(o, SEV_SCREENS_CHANGED);
 }
 
-void overlay_set_hidden(Overlay *o, bool hidden)
+void overlay_refresh_visibility(Overlay *o)
 {
-    if (o->hidden == hidden) return;
-    char u8[MAX_PATH * 4];
-    log_info("GIF #%d %s: %s", o->id, hidden ? "hidden" : "shown",
-             applog_u8(overlay_name(o), u8, sizeof(u8)));
-    if (hidden) overlay_announce(o, false);
-    o->hidden = hidden;
+    if (!o || !o->hwnd) return;
+    bool hidden = overlay_effective_hidden(o);
+    bool visible = IsWindowVisible(o->hwnd) != FALSE;
+    if (hidden == !visible) return;
     if (hidden) {
+        overlay_announce(o, false);
         ShowWindow(o->hwnd, SW_HIDE);
         overlay_detach_surface(o);
         /* Keep the decoders (size, frame cache, hitbox) but drop the canvases. */
@@ -1277,6 +1432,16 @@ void overlay_set_hidden(Overlay *o, bool hidden)
     overlay_announce(o, true);
     overlay_refresh_hook();
     moved_externally(o); /* The script resumes from wherever the window is now. */
+}
+
+void overlay_set_hidden(Overlay *o, bool hidden)
+{
+    if (o->hidden == hidden) return;
+    char u8[MAX_PATH * 4];
+    log_info("GIF #%d %s: %s", o->id, hidden ? "hidden" : "shown",
+             applog_u8(overlay_name(o), u8, sizeof(u8)));
+    o->hidden = hidden;
+    overlay_refresh_visibility(o);
 }
 
 /* ---- contacts and peer events ---------------------------------------------- */
@@ -1345,7 +1510,7 @@ void overlay_update_contacts(void)
     ContactBox boxes[SCRIPT_MAX_PEERS + 1];
     int n = 0;
     for (Overlay *o = g_app.overlays; o && n < SCRIPT_MAX_PEERS + 1; o = o->next) {
-        if (o->hidden) continue; /* Not on screen: touches nothing. */
+        if (overlay_effective_hidden(o)) continue; /* Not on screen: touches nothing. */
         double x, y;
         int hb[4];
         peer_rect(o, &x, &y);
@@ -1369,7 +1534,7 @@ void overlay_update_contacts(void)
         if (!o->peer_dirty) continue;
         o->peer_dirty = false;
         if (effective_clickthrough(o) && (o->subs & SEV_INPUT_MASK)) watch_moved = true;
-        if (!any_sub || o->hidden) continue;
+        if (!any_sub || overlay_effective_hidden(o)) continue;
         ScriptPeer p;
         fill_peer(o, &p);
         broadcast_peer(o, SEV_PEER_MOVED, &p);
@@ -1898,6 +2063,7 @@ Overlay *overlay_create(const OverlayConfig *cfg, bool use_position, int cascade
     const char *stage = "out of memory";
     init_defaults(o);
     o->id = g_app.next_overlay_id++;
+    o->uid = cfg->uid ? cfg->uid : app_uid_alloc();
     o->scale_pct = valid_scale(cfg->scale_pct);
     o->paused = cfg->paused;
     o->topmost = cfg->topmost;
@@ -1915,6 +2081,7 @@ Overlay *overlay_create(const OverlayConfig *cfg, bool use_position, int cascade
     stage = "cannot open GIF";
     if (!clip_open(&o->clips[0], "main", o->path, &key, o->scale_pct, false)) goto fail;
     o->clip_count = 1;
+    o->still_image = o->clips[0].gif->is_still;
 
     /* WS_EX_TOOLWINDOW without an owner keeps it off the taskbar and Alt+Tab.
      * WS_EX_NOREDIRECTIONBITMAP: DWM composes only our DirectComposition visual. */
@@ -1941,7 +2108,9 @@ Overlay *overlay_create(const OverlayConfig *cfg, bool use_position, int cascade
     else ShowWindow(o->hwnd, SW_SHOWNOACTIVATE);
     /* A custom script that has gone missing is dropped silently on restore. */
     if (cfg->script && *cfg->script) {
-        if (find_builtin(cfg->script) || GetFileAttributesW(cfg->script) != INVALID_FILE_ATTRIBUTES) {
+        if (cfg->defer_script) {
+            o->script_spec = dup_wcs(cfg->script);
+        } else if (find_builtin(cfg->script) || GetFileAttributesW(cfg->script) != INVALID_FILE_ATTRIBUTES) {
             overlay_set_script(o, cfg->script);
         } else {
             char spec_u8[MAX_PATH * 4];
@@ -2010,7 +2179,7 @@ void overlay_replace(Overlay *o, const wchar_t *path)
     ClipKey key = overlay_key(o);
     wchar_t *p = dup_wcs(path);
     char u8[MAX_PATH * 4];
-    if (!p || !clip_open(&c, "main", path, &key, o->scale_pct, o->hidden)) {
+    if (!p || !clip_open(&c, "main", path, &key, o->scale_pct, overlay_effective_hidden(o))) {
         free(p);
         log_error("cannot replace GIF: %s", applog_u8(path, u8, sizeof(u8)));
         app_error(TXT_ERR_OPEN_GIF, path);
@@ -2030,6 +2199,8 @@ void overlay_replace(Overlay *o, const wchar_t *path)
     free_snapshot(&o->play);
     clip_close(&o->clips[0]);
     o->clips[0] = c;
+    o->still_image = c.gif->is_still;
+    o->is_static = o->still_image;
     o->play.clip = 0;
     o->play.frame = 0;
     free(o->path);
@@ -2076,7 +2247,7 @@ static void apply_color_key(Overlay *o)
 /* Re-decode from frame 0 with the canvas a scale of pct needs. */
 static void apply_canvas_for(Overlay *o, int pct)
 {
-    if (o->hidden) return; /* Rebuilt when shown. */
+    if (overlay_effective_hidden(o)) return; /* Rebuilt when shown. */
     Clip *c = cur_clip(o);
     int w, h;
     clip_canvas_size(c->gif, pct, &w, &h);
@@ -2133,6 +2304,7 @@ void overlay_command(Overlay *o, UINT cmd)
 {
     switch (cmd) {
     case OVERLAY_CMD_PAUSE:
+        if (o->still_image) return;
         o->paused = !o->paused;
         if (!o->paused) {
             o->next_frame = app_now();
@@ -2163,6 +2335,9 @@ void overlay_command(Overlay *o, UINT cmd)
     case OVERLAY_CMD_HIDE:
         overlay_set_hidden(o, !o->hidden);
         if (o->hidden) app_notify(TXT_HIDDEN_TITLE, TXT_HIDDEN_TEXT);
+        break;
+    case OVERLAY_CMD_MASTER_NONE:
+        overlay_unbind_master(o, true);
         break;
     case OVERLAY_CMD_RECENTER:
         center_on_primary(o, 0);
@@ -2266,8 +2441,38 @@ void overlay_command(Overlay *o, UINT cmd)
     app_changed();
 }
 
+#define MASTER_ID_SPAN 100000
+void overlay_master_command(UINT cmd)
+{
+    if (cmd < OVERLAY_MASTER_CMD_BASE) return;
+    UINT packed = cmd - OVERLAY_MASTER_CMD_BASE;
+    Overlay *slave = find_overlay((int)(packed / MASTER_ID_SPAN));
+    Overlay *master = find_overlay((int)(packed % MASTER_ID_SPAN));
+    if (!slave || !master) return;
+    wchar_t err[256];
+    if (!overlay_bind_master(slave, master, err, ARRAYSIZE(err)))
+        app_notify(TXT_MENU_MASTER, err);
+}
+
 void overlay_build_menu(const Overlay *o, HMENU menu, UINT base)
 {
+    HMENU master = CreatePopupMenu();
+    if (master) {
+        AppendMenuW(master, MF_STRING | (o->master ? 0 : MF_CHECKED), base + OVERLAY_CMD_MASTER_NONE,
+                    TXT_MENU_MASTER_NONE);
+        if (overlay_has_slaves(o)) {
+            AppendMenuW(master, MF_STRING | MF_GRAYED, 0, TXT_MENU_MASTER_CHAIN);
+        } else {
+            for (Overlay *cand = g_app.overlays; cand; cand = cand->next) {
+                if (cand == o || cand->master) continue;
+                wchar_t label[MAX_PATH + 32];
+                _snwprintf_s(label, ARRAYSIZE(label), _TRUNCATE, L"%s  #%d", overlay_name(cand), cand->id);
+                AppendMenuW(master, MF_STRING | (o->master == cand ? MF_CHECKED : 0),
+                            OVERLAY_MASTER_CMD_BASE + (UINT)o->id * MASTER_ID_SPAN + (UINT)cand->id, label);
+            }
+        }
+        AppendMenuW(menu, MF_POPUP | (o->master ? MF_CHECKED : 0), (UINT_PTR)master, TXT_MENU_MASTER);
+    }
     HMENU key = CreatePopupMenu();
     if (key) {
         wchar_t label[64];
@@ -2307,17 +2512,21 @@ void overlay_build_menu(const Overlay *o, HMENU menu, UINT base)
         AppendMenuW(motion, MF_STRING | (*spec ? 0 : MF_GRAYED), base + OVERLAY_CMD_SCRIPT_RELOAD, TXT_MENU_SCRIPT_RELOAD);
     }
     UINT chk;
-    AppendMenuW(menu, MF_STRING | (o->failed ? MF_GRAYED : 0),
+    AppendMenuW(menu, MF_STRING | (o->failed || o->still_image ? MF_GRAYED : 0),
                 base + OVERLAY_CMD_PAUSE, o->paused ? TXT_MENU_RESUME : TXT_MENU_PAUSE);
     AppendMenuW(menu, MF_STRING, base + OVERLAY_CMD_REPLACE, TXT_MENU_REPLACE);
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     {
         wchar_t label[32];
         _snwprintf_s(label, 32, _TRUNCATE, TXT_MENU_SCALE, o->scale_pct);
-        AppendMenuW(menu, MF_STRING | (o->hidden ? MF_GRAYED : 0), base + OVERLAY_CMD_SCALE, label);
+        AppendMenuW(menu, MF_STRING | (overlay_effective_hidden(o) ? MF_GRAYED : 0),
+                    base + OVERLAY_CMD_SCALE, label);
     }
     if (key) AppendMenuW(menu, MF_POPUP | (o->key_enabled ? MF_CHECKED : 0), (UINT_PTR)key, TXT_MENU_COLOR_KEY);
-    if (motion) {
+    if (o->master) {
+        if (motion) DestroyMenu(motion);
+        AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, TXT_MENU_SCRIPT_SLAVE);
+    } else if (motion) {
         bool on = o->script_spec && *o->script_spec;
         AppendMenuW(menu, MF_POPUP | (on ? MF_CHECKED : 0), (UINT_PTR)motion, TXT_MENU_SCRIPT);
     }
@@ -2350,4 +2559,8 @@ void overlay_to_config(const Overlay *o, OverlayConfig *out)
     out->key_rgb = o->key_rgb;
     out->key_tolerance = o->key_tolerance;
     out->script = o->script_spec ? o->script_spec : L"";
+    out->uid = o->uid;
+    out->master_uid = o->master ? o->master->uid : 0;
+    out->group_uid = o->group ? o->group->uid : 0;
+    out->defer_script = false;
 }

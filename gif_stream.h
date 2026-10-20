@@ -1,10 +1,13 @@
 #ifndef YAGP_GIF_STREAM_H
 #define YAGP_GIF_STREAM_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <wchar.h>
 #include <gif_lib.h>
+
+#include "still_image.h"
 
 typedef struct GifStream {
     void *file;            /* HANDLE */
@@ -12,7 +15,11 @@ typedef struct GifStream {
     const uint8_t *data;   /* Read-only view of the whole file (shared page cache). */
     size_t size, pos;
     GifFileType *decoder;
-    int width, height;     /* Logical screen size of the GIF. */
+    int width, height;     /* Logical screen size of the GIF, or source image dimensions. */
+    /* Still-image mode: PNG/JPG/JPEG is decoded once and behaves as one frame. */
+    bool is_still;
+    StillImage still;
+    bool still_shown;
     /* Canvas size: width x height, or smaller (gif_stream_set_output_size). */
     int out_w, out_h;
     uint8_t *bgra;         /* out_w x out_h premultiplied BGRA; GIF alpha is only 0 or 255. */

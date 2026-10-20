@@ -85,9 +85,15 @@ target_include_directories(rxilog PUBLIC ${rxilog_SOURCE_DIR}/src)
 target_compile_definitions(rxilog PRIVATE _CRT_SECURE_NO_WARNINGS)
 target_compile_options(rxilog PRIVATE /W0)
 
+# stb_image v2.30 is vendored under third_party/ (MIT/public domain): still
+# PNG/JPG/JPEG decoding only; giflib remains the animated-GIF decoder.
+
 add_executable(yagp WIN32
     main.c overlay.c clip.c clip_path.c config.c cursor_hook.c dialogs.c gif_stream.c frame_cache.c
+    still_image.c stb_image.c group.c
     applog.c dx11_renderer.cpp input_fsm.c monitors.c script.c contacts.c transform.c presets.rc app.manifest)
+target_include_directories(yagp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+set_source_files_properties(stb_image.c PROPERTIES COMPILE_OPTIONS "/W0")
 # UI language for i18n.h: zh_CN (default) or en.
 set(YAGP_LANG "zh_CN" CACHE STRING "UI language (zh_CN, en)")
 set_property(CACHE YAGP_LANG PROPERTY STRINGS zh_CN en)
@@ -110,10 +116,16 @@ target_link_options(yagp PRIVATE /GUARD:CF /DYNAMICBASE /NXCOMPAT
 set_property(TARGET yagp giflib lua PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
 
 # Decoder regression test: python tests/test_gif_stream.py build/gif_dump.exe
-add_executable(gif_dump EXCLUDE_FROM_ALL tests/gif_dump.c gif_stream.c frame_cache.c)
-target_include_directories(gif_dump PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+add_executable(gif_dump EXCLUDE_FROM_ALL tests/gif_dump.c gif_stream.c frame_cache.c still_image.c stb_image.c)
+target_include_directories(gif_dump PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
 target_compile_definitions(gif_dump PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
+set_source_files_properties(stb_image.c PROPERTIES COMPILE_OPTIONS "/W0")
 target_link_libraries(gif_dump PRIVATE giflib user32 shell32 ole32)
+
+# Static image regression helper: tests/test_still_image.py build/image_dump.exe
+add_executable(image_dump EXCLUDE_FROM_ALL tests/image_dump.c still_image.c stb_image.c)
+target_include_directories(image_dump PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+target_compile_definitions(image_dump PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
 
 # Lua host + preset regression test: build/script_test.exe
 add_executable(script_test EXCLUDE_FROM_ALL tests/script_test.c script.c monitors.c contacts.c clip_path.c
@@ -123,6 +135,20 @@ target_compile_definitions(script_test PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_W
     YAGP_SCRIPT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/scripts" ${YAGP_LANG_DEFINE})
 target_compile_options(script_test PRIVATE /W4 /utf-8)
 target_link_libraries(script_test PRIVATE lua rxilog user32 shcore)
+
+# Config v3/v4 parser and round-trip test (uses a redirected test folder).
+add_executable(config_test EXCLUDE_FROM_ALL tests/config_test.c config.c)
+target_include_directories(config_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(config_test PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS YAGP_CONFIG_TEST)
+target_compile_options(config_test PRIVATE /W4 /utf-8)
+target_link_libraries(config_test PRIVATE rxilog shell32 ole32)
+
+# Group folder scanner regression test (overlay/app stubs live in the test).
+add_executable(group_test EXCLUDE_FROM_ALL tests/group_test.c group.c applog.c)
+target_include_directories(group_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(group_test PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
+target_compile_options(group_test PRIVATE /W4 /utf-8)
+target_link_libraries(group_test PRIVATE giflib rxilog)
 
 # File-output regression test for applog.c: build/log_test.exe. The smaller cap
 # lets the test reach the session limit without writing 16 MB.
