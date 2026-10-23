@@ -67,12 +67,12 @@ python tools/make_icon.py    # needs Pillow; edit RADIUS in the script to change
   per-media submenu, groups, pause/resume all, start with Windows, delete
   settings data, exit. Media with a motion script are tagged "(moving)".
 - Right-click media (or its tray submenu): hide/show, plus pause/resume, replace,
-  scale, colour key, motion script, master/slave relation, always on top, lock
+  scale, colour key, motion script, leader/follower relation, always on top, lock
   position, click-through, move to screen centre, remove.
 - Images: add/replace/group import accept `.png`, `.jpg`, `.jpeg`. PNG alpha is
   preserved; JPEG is opaque. Still images have no animation: pause/resume,
   seek, clip and speed controls are unavailable, but movement, scale,
-  transforms, opacity, colour key, scripts, hiding and master/slave control
+  transforms, opacity, colour key, scripts, hiding and leader/follower control
   remain available. APNG is shown as its first frame; animated WebP/AVIF is not
   supported.
 - Groups: tray "Groups → Import group…" picks a folder and recursively scans
@@ -80,11 +80,11 @@ python tools/make_icon.py    # needs Pillow; edit RADIUS in the script to change
   `cat.png` + `cat.lua`). Unpaired media are treated as clip assets. Each group
   gets a tray submenu with hide/show and remove; group hiding does not overwrite
   members' own hidden flags.
-- Master/slave: right-click media → "Belongs to…" to choose one master. A
-  master may have multiple slaves, only one level is allowed and cycles are
-  rejected. A slave's script is stopped but its binding is preserved; unlinking
-  or removing the master restores it. The master script controls slaves through
-  the chainable `yagp.slaves()` / `yagp.slave(id)` handles.
+- Leader/follower: right-click media → "Belongs to…" to choose one leader. A
+  leader may have multiple followers, only one level is allowed and cycles are
+  rejected. A follower's script is stopped but its binding is preserved; unlinking
+  or removing the leader restores it. The leader script controls followers through
+  the chainable `yagp.followers()` / `yagp.follower(id)` handles.
 - Hide takes media off the screen without removing it. It stays in the tray
   menu (tagged "(hidden)"); "Show" in its submenu brings it back with the same
   position, scale, colour key and script. While hidden it does not animate or
@@ -103,7 +103,7 @@ python tools/make_icon.py    # needs Pillow; edit RADIUS in the script to change
   (per-user, no admin rights). It shows as checked only if the entry points at
   the running exe. Startup is silent: no notification is shown.
 - State is saved to `%APPDATA%\YAGP\config.txt` (1 s debounce, and on exit),
-  including each media's script binding, groups and master/slave relations. The
+  including each media's script binding, groups and leader/follower relations. The
   format is v4; older v1-v3 files are read automatically. "Delete settings data"
   removes `%APPDATA%\YAGP`, the frame cache in `%LOCALAPPDATA%\YAGP` and the
   startup entry; after that nothing is saved until the next launch. Your own
@@ -144,7 +144,7 @@ Redirected output is UTF-8; a console is written with `WriteConsoleW`.
 
 - `example/image/`: PNG/JPG still images, alpha/hitbox, movement/transforms,
   disabled playback controls
-- `example/master-slave/`: chainable master/slave control (manual menu binding)
+- `example/leader-follower/`: chainable leader/follower control (manual menu binding)
 - `example/group/`: group import, group hide/show/remove, individual-vs-group
   hiding
 
@@ -220,27 +220,27 @@ above the primary monitor). Positions refer to the window's top-left corner.
 | `yagp.set_rate(hz)` | `update` calls per second, 1-144, default 60 |
 | `yagp.name` | GIF file name |
 | `yagp.id` | This GIF's id, unique for this run (changes on restart) |
-| `yagp.others()` | Every other media: `{ {id, name, x, y, w, h, hx, hy, hw, hh, cx, cy, vx, vy, scripted, paused, still, controlled, master, master_id}, ... }`, including ones without a script and paused ones. `x, y, w, h` is the window, `hx, hy, hw, hh` the visible area, `cx, cy` its centre. `vx`, `vy` are px/s over its last tick, 0 when not moving. `still` marks images, `controlled` marks slaves, `master` marks overlays with slaves |
+| `yagp.others()` | Every other media: `{ {id, name, x, y, w, h, hx, hy, hw, hh, cx, cy, vx, vy, scripted, paused, still, controlled, leader, leader_id}, ... }`, including ones without a script and paused ones. `x, y, w, h` is the window, `hx, hy, hw, hh` the visible area, `cx, cy` its centre. `vx`, `vy` are px/s over its last tick, 0 when not moving. `still` marks images, `controlled` marks followers, `leader` marks overlays with followers |
 | `yagp.peer(id)` | One GIF's peer table, or nil |
 | `yagp.overlaps([x, y [, w, h]])` | Other GIFs whose visible area overlaps this GIF's. No arguments: where it is now; x, y: with the window moved there; explicit w, h: that rect at x, y. Sharing an edge is not an overlap |
 | `log.trace(...)`, `log.debug(...)`, `log.info(...)`, `log.warn(...)`, `log.error(...)`, `log.fatal(...)` | Write a log line tagged `script <name>#<id>`. Arguments are converted without metamethods and joined with tabs; long messages keep 1024 bytes and a `...` marker. At most 100 lines per second per script; the excess is dropped and summarised |
 | `yagp.notify(text)`, `yagp.notify(title, text)` | Show a tray balloon (default title `YAGP`). Returns `true` if it was shown, `false` when throttled (at most one per 3 s per script) or unavailable. Values are converted like `log.*`; the tray field limits are applied |
-| `yagp.slaves()` | Array of chainable handles for this overlay's direct slaves; empty when it is not a master |
-| `yagp.slave(id)` | Handle for one direct slave, or nil |
-| `slave:pos()`, `size()`, `center()`, `hitbox()`, `frame()`, `clip_info(name)`, `name()`, `id()`, `paused()`, `hidden()` | Query slave state; nil after the slave is gone |
-| `slave:set_pos(...)`, `move(...)`, `set_flip(...)`, `set_hitbox(...)` | Move/flip/hitbox; returns the same handle |
-| `slave:clip(...)`, `unload(...)`, `play(...)`, `seek(...)`, `set_speed(...)`, `set_playing(...)`, `set_paused(...)` | Slave GIF playback; returns the handle, or nil, err on failure. On still images these return "no animation" |
-| `slave:set_matrix(...)`, `set_transform(...)`, `reset_transform(...)`, `set_opacity(...)` | Slave transform/opacity; returns the handle |
-| `slave:set_cursor(...)`, `set_draggable(...)`, `set_clickthrough(...)`, `hide()`, `show()` | Slave input/visibility; returns the handle |
+| `yagp.followers()` | Array of chainable handles for this overlay's direct followers; empty when it is not a leader |
+| `yagp.follower(id)` | Handle for one direct follower, or nil |
+| `follower:pos()`, `size()`, `center()`, `hitbox()`, `frame()`, `clip_info(name)`, `name()`, `id()`, `paused()`, `hidden()` | Query follower state; nil after the follower is gone |
+| `follower:set_pos(...)`, `move(...)`, `set_flip(...)`, `set_hitbox(...)` | Move/flip/hitbox; returns the same handle |
+| `follower:clip(...)`, `unload(...)`, `play(...)`, `seek(...)`, `set_speed(...)`, `set_playing(...)`, `set_paused(...)` | Follower GIF playback; returns the handle, or nil, err on failure. On still images these return "no animation" |
+| `follower:set_matrix(...)`, `set_transform(...)`, `reset_transform(...)`, `set_opacity(...)` | Follower transform/opacity; returns the handle |
+| `follower:set_cursor(...)`, `set_draggable(...)`, `set_clickthrough(...)`, `hide()`, `show()` | Follower input/visibility; returns the handle |
 
-A slave's own script is stopped; the master cannot remove slaves, replace their
+A follower's own script is stopped; the leader cannot remove followers, replace their
 files, change their script binding or change the relation. Chain example:
 
 ```lua
-yagp.slave(id):set_pos(x, y):set_flip(true):play("walk", {loop = true}):set_opacity(0.5, 0.2)
+yagp.follower(id):set_pos(x, y):set_flip(true):play("walk", {loop = true}):set_opacity(0.5, 0.2)
 ```
 
-Other overlays are read-only; only overlays bound as this master's slaves can be
+Other overlays are read-only; only overlays bound as this leader's followers can be
 controlled. A script sees at most 64 other overlays.
 
 **Visible area (hitbox).** Edges and collisions use the GIF's visible area,
@@ -415,8 +415,8 @@ out\Release\log_test.exe
 
 The still-image test generates PNG/JPEG fixtures with Pillow and covers alpha,
 colour key, hitbox, JPEG decoding, corrupt files and oversized-image rejection;
-`script_test` covers chainable slave handles, safe invalidation after deletion
-and rejection of animation calls on still slaves.
+`script_test` covers chainable follower handles, safe invalidation after deletion
+and rejection of animation calls on still followers.
 
 The decoder test compares composited frames and delays against Pillow,
 covering disposal 1/2/3, interlacing, looping via `gif_stream_restart`, colour
@@ -469,9 +469,9 @@ the user's profile.
 - Groups import only same-directory, same-stem media + `.lua` pairs; unpaired
   media are treated as clip assets. There is no tab window and no manual
   member rename/add/remove.
-- Master/slave is one level only: a slave cannot be a master and a master cannot
-  become a slave. A slave's script stays stopped while bound and resumes after
-  unlinking or when its master is removed.
+- Leader/follower is one level only: a follower cannot be a leader and a leader cannot
+  become a follower. A follower's script stays stopped while bound and resumes after
+  unlinking or when its leader is removed.
 
 ## License
 

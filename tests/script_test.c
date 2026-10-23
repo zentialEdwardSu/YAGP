@@ -1158,42 +1158,42 @@ static const ScriptHostExtOps EXT = {x_load_clip, x_unload_clip, x_clip_info, x_
                                      x_set_draggable, x_set_clickthrough, x_subs_changed, x_now, x_notify,
                                      NULL, NULL, NULL, NULL};
 
-/* A very small fake master/slave world for the chainable handle tests. */
-static FakeWin *s_slave;
+/* A very small fake leader/follower world for the chainable handle tests. */
+static FakeWin *s_follower;
 
-static int slave_list(void *ctx, int *ids, int cap)
+static int follower_list(void *ctx, int *ids, int cap)
 {
     (void)ctx;
-    if (!s_slave || cap < 1) return 0;
-    ids[0] = s_slave->id;
+    if (!s_follower || cap < 1) return 0;
+    ids[0] = s_follower->id;
     return 1;
 }
-static void *slave_resolve(void *ctx, int id)
+static void *follower_resolve(void *ctx, int id)
 {
     (void)ctx;
-    return s_slave && s_slave->id == id ? s_slave : NULL;
+    return s_follower && s_follower->id == id ? s_follower : NULL;
 }
-static const char *slave_name(void *ctx, int id)
+static const char *follower_name(void *ctx, int id)
 {
     (void)ctx;
-    return s_slave && s_slave->id == id ? "slave" : NULL;
+    return s_follower && s_follower->id == id ? "follower" : NULL;
 }
-static bool slave_hidden(void *target) { return ((FakeWin *)target)->hidden; }
-static bool slave_paused(void *target) { return ((FakeWin *)target)->paused; }
-static bool slave_static(void *target) { return ((FakeWin *)target)->still; }
+static bool follower_hidden(void *target) { return ((FakeWin *)target)->hidden; }
+static bool follower_paused(void *target) { return ((FakeWin *)target)->paused; }
+static bool follower_static(void *target) { return ((FakeWin *)target)->still; }
 
-static const ScriptSlaveOps SLAVE_OPS = {slave_list, slave_resolve, slave_name,
-                                         slave_hidden, slave_paused, slave_static};
+static const ScriptFollowerOps FOLLOWER_OPS = {follower_list, follower_resolve, follower_name,
+                                         follower_hidden, follower_paused, follower_static};
 
-static const ScriptHostExtOps EXT_SLAVES = {
+static const ScriptHostExtOps EXT_FOLLOWERS = {
     x_load_clip, x_unload_clip, x_clip_info, x_play, x_seek, x_get_frame,
     x_set_speed, x_set_playing, x_set_matrix, x_set_opacity, x_set_cursor,
     x_set_draggable, x_set_clickthrough, x_subs_changed, x_now, x_notify,
-    NULL, NULL, NULL, &SLAVE_OPS};
+    NULL, NULL, NULL, &FOLLOWER_OPS};
 
-static Script *load_ext_slave(FakeWin *w, const char *src, wchar_t *err)
+static Script *load_ext_follower(FakeWin *w, const char *src, wchar_t *err)
 {
-    return script_create_ex(&OPS, &EXT_SLAVES, w, src, strlen(src), "test.lua", "test.gif", w->id, err, 512);
+    return script_create_ex(&OPS, &EXT_FOLLOWERS, w, src, strlen(src), "test.lua", "test.gif", w->id, err, 512);
 }
 
 static Script *load_ext(FakeWin *w, const char *src, wchar_t *err)
@@ -1799,50 +1799,50 @@ static void test_log_no_ext(void)
     script_destroy(s);
 }
 
-static void test_slave_api(void)
+static void test_follower_api(void)
 {
     wchar_t err[512];
-    FakeWin master = {0, 0, 50, 50, false, 0, 0};
-    FakeWin slave = {200, 200, 40, 40, false, 0, 0};
-    master.id = 1;
-    slave.id = 7;
-    s_slave = &slave;
+    FakeWin leader = {0, 0, 50, 50, false, 0, 0};
+    FakeWin follower = {200, 200, 40, 40, false, 0, 0};
+    leader.id = 1;
+    follower.id = 7;
+    s_follower = &follower;
     memset(&s_ext, 0, sizeof(s_ext));
-    Script *s = load_ext_slave(&master,
-        "local h = yagp.slave(7) assert(h)\n"
-        "assert(#yagp.slaves() == 1 and yagp.slave(99) == nil)\n"
+    Script *s = load_ext_follower(&leader,
+        "local h = yagp.follower(7) assert(h)\n"
+        "assert(#yagp.followers() == 1 and yagp.follower(99) == nil)\n"
         "local r = h:set_pos(11, 22):set_flip(true):set_opacity(0.5, 0)\n"
         "assert(r == h)\n"
         "local x, y = h:pos() assert(x == 11 and y == 22)\n"
-        "assert(h:id() == 7 and h:name() == 'slave')\n"
+        "assert(h:id() == 7 and h:name() == 'follower')\n"
         "keep = h\n"
-        "function dead() assert(yagp.slave(7) == nil)\n"
+        "function dead() assert(yagp.follower(7) == nil)\n"
         "  assert(keep:set_pos(1, 2) == keep) assert(keep:pos() == nil) end\n", err);
-    CHECK(s, "slave load: %ls", err);
+    CHECK(s, "follower load: %ls", err);
     if (s) {
-        CHECK(slave.x == 11 && slave.y == 22 && slave.flip, "slave chain setters");
-        s_slave = NULL;
-        CHECK(run_check(s, "dead"), "deleted slave handle");
+        CHECK(follower.x == 11 && follower.y == 22 && follower.flip, "follower chain setters");
+        s_follower = NULL;
+        CHECK(run_check(s, "dead"), "deleted follower handle");
         script_destroy(s);
     }
 
-    FakeWin master2 = {0, 0, 50, 50, false, 0, 0};
+    FakeWin leader2 = {0, 0, 50, 50, false, 0, 0};
     FakeWin image = {200, 200, 40, 40, false, 0, 0};
-    master2.id = 2;
+    leader2.id = 2;
     image.id = 8;
     image.still = true;
-    s_slave = &image;
-    s = load_ext_slave(&master2,
-        "local h = yagp.slave(8) assert(h)\n"
+    s_follower = &image;
+    s = load_ext_follower(&leader2,
+        "local h = yagp.follower(8) assert(h)\n"
         "local ok, e = h:play('walk') assert(ok == nil and e)\n"
         "assert(h:set_pos(3, 4) == h)\n"
         "local x, y = h:pos() assert(x == 3 and y == 4)\n", err);
-    CHECK(s, "static slave load: %ls", err);
+    CHECK(s, "static follower load: %ls", err);
     if (s) {
-        CHECK(image.x == 3 && image.y == 4, "static slave movement");
+        CHECK(image.x == 3 && image.y == 4, "static follower movement");
         script_destroy(s);
     }
-    s_slave = NULL;
+    s_follower = NULL;
 }
 
 int main(void)
@@ -1873,7 +1873,7 @@ int main(void)
     test_log_rate_limit();
     test_lua_notify();
     test_log_no_ext();
-    test_slave_api();
+    test_follower_api();
     if (s_failures) {
         printf("%d check(s) failed\n", s_failures);
         return 1;

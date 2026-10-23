@@ -1,7 +1,7 @@
--- Slave demo: this output stops while the GIF is bound to a master, and appears
+-- Follower demo: this output stops while the GIF is bound to a leader, and appears
 -- again after the relation is removed.
-log.info("SLAVE SCRIPT RAN")
-yagp.notify("YAGP demo", "Slave script is running; bind it via Belongs to…")
+log.info("FOLLOWER SCRIPT RAN")
+yagp.notify("YAGP demo", "Follower script is running; bind it via Belongs to…")
 
 local x0, y0 = yagp.pos()
 local t = 0

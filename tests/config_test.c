@@ -109,7 +109,7 @@ int main(void)
     overlays[0].y = 2;
     overlays[0].scale_pct = 100;
     overlays[1].uid = 2;
-    overlays[1].master_uid = 1;
+    overlays[1].leader_uid = 1;
     overlays[1].path = L"C:\\pics\\b.png";
     overlays[1].hidden = true;
     overlays[1].key_enabled = true;
@@ -135,7 +135,7 @@ int main(void)
               wcscmp(cap.groups[0].name, L"demo") == 0, "v4 group");
     check(cap.overlays[0].group_uid == 10 && wcscmp(cap.overlays[0].script, L"a.lua") == 0,
           "v4 group member");
-    check(cap.overlays[1].master_uid == 1 && cap.overlays[1].hidden &&
+    check(cap.overlays[1].leader_uid == 1 && cap.overlays[1].hidden &&
               cap.overlays[1].key_enabled && cap.overlays[1].key_rgb == 0x112233 &&
               cap.overlays[1].key_tolerance == 7, "v4 overlay fields");
 

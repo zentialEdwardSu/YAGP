@@ -47,7 +47,7 @@ python tools/make_icon.py    # 需要 Pillow；改脚本里的 RADIUS 可调整�
 - 隐藏：媒体从屏幕上消失，但不会被删除，仍保留在托盘菜单里（标为"(已隐藏)"），在它的子菜单里点"显示"即可恢复，位置、缩放、色键和脚本都不变。隐藏期间不播放、不运行脚本，其他脚本也看不到它，并会释放交换链和画布内存。隐藏状态会保存，重启后仍是隐藏的。
 - 图片：添加/替换/分组导入支持 `.png`、`.jpg`、`.jpeg`。PNG 保留 alpha，JPEG 按不透明处理；静态图没有动画，暂停/继续、seek、clip、播放速度等播放控制不可用，但移动、缩放、变换、透明度、色键、脚本、隐藏和主从控制仍然可用。APNG 只显示第一帧；不支持 WebP/AVIF 动画。
 - 分组：托盘"分组 → 导入分组…"选择一个文件夹，递归扫描其中**同目录同名**的媒体与 `.lua`（如 `pet.gif` + `pet.lua`、`cat.png` + `cat.lua`），未配对的文件当作 clip 素材忽略。每个分组一个托盘子菜单，可以隐藏/显示整组或移除整组；组隐藏不会覆盖成员自己的隐藏状态。
-- 主从：右键媒体 →"从属于…"选择一个主，一个主可以带多个从，只允许一层、不能成环。从的脚本不执行但保留绑定；解除主从后恢复。主的脚本通过 `yagp.slaves()`/`yagp.slave(id)` 获取链式从 handle，控制从的移动、播放、变换、输入和可见性。
+- 主从：右键媒体 →"从属于…"选择一个主，一个主可以带多个从，只允许一层、不能成环。从的脚本不执行但保留绑定；解除主从后恢复。主的脚本通过 `yagp.followers()`/`yagp.follower(id)` 获取链式从 handle，控制从的移动、播放、变换、输入和可见性。
 - 缩放：5% 到 250% 的滑块，实时预览。也可以直接输入数值，或点 100% 按钮。方向键每次 1%，PgUp/PgDn 每次 25%。取消会恢复原尺寸。缩放时 GIF 的中心点保持不动。
 - 色键抠图：输入十六进制颜色（`#00FF00`、`00ff00`、`#0F0`）和每通道容差（0–255，默认 16），或者直接取第一帧左上角像素的颜色。匹配的像素在合成时变为透明。
 - 未锁定时，可以用鼠标左键拖动 GIF。
@@ -77,7 +77,7 @@ python tools/make_icon.py    # 需要 Pillow；改脚本里的 RADIUS 可调整�
 `example/` 下有新特性的独立 demo：
 
 - `example/image/`：PNG/JPG 静态图、alpha/hitbox、移动/变换、播放控制禁用
-- `example/master-slave/`：主从链式控制（需要手动右键绑定）
+- `example/leader-follower/`：主从链式控制（需要手动右键绑定）
 - `example/group/`：分组导入、组隐藏/显示/移除、成员自身隐藏交互
 
 详见 [example/README.md](example/README.md)。
@@ -138,23 +138,23 @@ python tools/make_icon.py    # 需要 Pillow；改脚本里的 RADIUS 可调整�
 | `yagp.set_rate(hz)` | 每秒调用 `update` 的次数，1–144，默认 60 |
 | `yagp.name` | GIF 文件名 |
 | `yagp.id` | 这个 GIF 的编号，本次运行内唯一，重启后会变 |
-| `yagp.others()` | 其他所有媒体：`{ {id, name, x, y, w, h, hx, hy, hw, hh, cx, cy, vx, vy, scripted, paused, still, controlled, master, master_id}, ... }`，包括没有脚本和已暂停的。`x, y, w, h` 是窗口，`hx, hy, hw, hh` 是可见区域，`cx, cy` 是可见区域的中心。`vx`、`vy` 是上一次 tick 的速度（像素/秒），不在运动时为 0。`still` 表示静态图，`controlled` 表示是从，`master` 表示有从 |
+| `yagp.others()` | 其他所有媒体：`{ {id, name, x, y, w, h, hx, hy, hw, hh, cx, cy, vx, vy, scripted, paused, still, controlled, leader, leader_id}, ... }`，包括没有脚本和已暂停的。`x, y, w, h` 是窗口，`hx, hy, hw, hh` 是可见区域，`cx, cy` 是可见区域的中心。`vx`、`vy` 是上一次 tick 的速度（像素/秒），不在运动时为 0。`still` 表示静态图，`controlled` 表示是从，`leader` 表示有从 |
 | `yagp.peer(id)` | 某一个 GIF 的信息表，不存在时为 nil |
 | `yagp.overlaps([x, y [, w, h]])` | 可见区域与自己重叠的其他 GIF 列表。不传参数时按当前位置算，传 x、y 时按窗口移到那里算，显式传 w、h 时用 x、y 处的这个矩形。只是边贴着边不算重叠 |
 | `log.trace(...)`、`log.debug(...)`、`log.info(...)`、`log.warn(...)`、`log.error(...)`、`log.fatal(...)` | 写一行带 `script <名称>#<id>` 标识的日志。参数不调用元方法，用制表符连接；超长消息保留 1024 字节并追加 `...`。每个脚本每秒最多 100 行，超出部分丢弃并汇总 |
 | `yagp.notify(text)`、`yagp.notify(title, text)` | 显示托盘气泡（标题默认 `YAGP`）。显示成功返回 `true`；因频率限制（每个脚本 3 秒一次）或宿主不可用而抑制时返回 `false`。参数转换规则同 `log.*`，并按托盘字段截断 |
-| `yagp.slaves()` | 当前媒体控制的直接从 handle 数组；不是主时为空 |
-| `yagp.slave(id)` | 指定 id 的从 handle；不是自己的从或不存在时为 nil |
-| `slave:pos()`、`size()`、`center()`、`hitbox()`、`frame()`、`clip_info(name)`、`name()`、`id()`、`paused()`、`hidden()` | 查询从的状态；从已删除时返回 nil |
-| `slave:set_pos(...)`、`move(...)`、`set_flip(...)`、`set_hitbox(...)` | 移动/翻转/命中区域，返回同一个 handle |
-| `slave:clip(...)`、`unload(...)`、`play(...)`、`seek(...)`、`set_speed(...)`、`set_playing(...)`、`set_paused(...)` | 从的 GIF 播放控制，返回 handle；失败返回 nil, err。静态图上的这些方法返回"没有动画" |
-| `slave:set_matrix(...)`、`set_transform(...)`、`reset_transform(...)`、`set_opacity(...)` | 从的变换/透明度，返回 handle |
-| `slave:set_cursor(...)`、`set_draggable(...)`、`set_clickthrough(...)`、`hide()`、`show()` | 从的输入/可见性，返回 handle |
+| `yagp.followers()` | 当前媒体控制的直接从 handle 数组；不是主时为空 |
+| `yagp.follower(id)` | 指定 id 的从 handle；不是自己的从或不存在时为 nil |
+| `follower:pos()`、`size()`、`center()`、`hitbox()`、`frame()`、`clip_info(name)`、`name()`、`id()`、`paused()`、`hidden()` | 查询从的状态；从已删除时返回 nil |
+| `follower:set_pos(...)`、`move(...)`、`set_flip(...)`、`set_hitbox(...)` | 移动/翻转/命中区域，返回同一个 handle |
+| `follower:clip(...)`、`unload(...)`、`play(...)`、`seek(...)`、`set_speed(...)`、`set_playing(...)`、`set_paused(...)` | 从的 GIF 播放控制，返回 handle；失败返回 nil, err。静态图上的这些方法返回"没有动画" |
+| `follower:set_matrix(...)`、`set_transform(...)`、`reset_transform(...)`、`set_opacity(...)` | 从的变换/透明度，返回 handle |
+| `follower:set_cursor(...)`、`set_draggable(...)`、`set_clickthrough(...)`、`hide()`、`show()` | 从的输入/可见性，返回 handle |
 
 从的脚本不执行；主不能删除从、更换从的文件、修改从的脚本绑定或主从关系。链式调用示例：
 
 ```lua
-yagp.slave(id):set_pos(x, y):set_flip(true):play("walk", {loop = true}):set_opacity(0.5, 0.2)
+yagp.follower(id):set_pos(x, y):set_flip(true):play("walk", {loop = true}):set_opacity(0.5, 0.2)
 ```
 
 其他 GIF 的信息是只读的；只有通过主从关系绑定到自己的从才能被控制。最多能看到 64 个其他 GIF。

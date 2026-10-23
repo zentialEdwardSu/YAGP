@@ -70,13 +70,13 @@ static void split_script(wchar_t *cursor, OverlayConfig *e)
     }
 }
 
-/* v4: o<TAB>uid<TAB>master<TAB>group<TAB>10 ints<TAB>path[<TAB>script] */
+/* v4: o<TAB>uid<TAB>leader<TAB>group<TAB>10 ints<TAB>path[<TAB>script] */
 static bool parse_v4_overlay(wchar_t *line, ConfigEntryFn fn, void *ctx)
 {
     wchar_t *cursor = line + 2;
     OverlayConfig e;
     memset(&e, 0, sizeof(e));
-    if (!parse_u64(&cursor, &e.uid) || !parse_u64(&cursor, &e.master_uid) ||
+    if (!parse_u64(&cursor, &e.uid) || !parse_u64(&cursor, &e.leader_uid) ||
         !parse_u64(&cursor, &e.group_uid)) return false;
     int v[10];
     for (int i = 0; i < 10; ++i) {
@@ -288,7 +288,7 @@ bool config_save(const ConfigSave *save)
         char head[256];
         int hn = _snprintf_s(head, sizeof(head), _TRUNCATE,
                              "o\t%llu\t%llu\t%llu\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%u\t%d\t",
-                             (unsigned long long)e->uid, (unsigned long long)e->master_uid,
+                             (unsigned long long)e->uid, (unsigned long long)e->leader_uid,
                              (unsigned long long)e->group_uid, e->x, e->y, e->scale_pct,
                              (e->paused ? 1 : 0) | (e->hidden ? 2 : 0), e->topmost, e->locked,
                              e->clickthrough, e->key_enabled, (unsigned)e->key_rgb, e->key_tolerance);

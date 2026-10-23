@@ -1,11 +1,11 @@
--- Master demo: move itself, and when a slave is bound control it through the
--- chainable yagp.slaves() handle. Binding is done from the tray menu.
+-- Leader demo: move itself, and when a follower is bound control it through the
+-- chainable yagp.followers() handle. Binding is done from the tray menu.
 local home_x, home_y = yagp.pos()
 local t = 0
 local last_notify = 0
 local last_log = 0
 
-yagp.notify("YAGP demo", "Master demo: right-click the slave and choose Belongs to…")
+yagp.notify("YAGP demo", "Leader demo: right-click the follower and choose Belongs to…")
 
 local function clamp(x, y, w, h)
   local work = yagp.monitor().work
@@ -24,16 +24,16 @@ end
 
 function update(dt)
   move_self(dt)
-  local slaves = yagp.slaves()
-  if #slaves == 0 then
+  local followers = yagp.followers()
+  if #followers == 0 then
     if t - last_notify > 6 then
       last_notify = t
-      yagp.notify("YAGP demo", "Master: bind the slave via Belongs to…")
+      yagp.notify("YAGP demo", "Leader: bind the follower via Belongs to…")
     end
     return
   end
 
-  local s = slaves[1]
+  local s = followers[1]
   local mx, my = yagp.pos()
   local sw, sh = s:size()
   local tx, ty = clamp(mx + math.cos(t * 1.2) * 90,
@@ -46,6 +46,6 @@ function update(dt)
 
   if t - last_log > 8 then
     last_log = t
-    log.info("master demo: controlling slave", s:id(), s:name())
+    log.info("leader demo: controlling follower", s:id(), s:name())
   end
 end

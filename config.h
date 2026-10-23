@@ -17,7 +17,7 @@ typedef struct OverlayConfig {
     /* Motion script: "" (none), "builtin:<name>" or an absolute .lua path. */
     const wchar_t *script;
     uint64_t uid;         /* Stable identity; 0 = allocate on load. */
-    uint64_t master_uid;  /* 0 = not a slave. */
+    uint64_t leader_uid;  /* 0 = not a follower. */
     uint64_t group_uid;   /* 0 = no group. */
     bool defer_script;    /* Restore phase: create the overlay before starting it. */
 } OverlayConfig;

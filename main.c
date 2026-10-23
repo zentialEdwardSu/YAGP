@@ -45,7 +45,7 @@ enum {
     TRAY_CMD_GROUP_IMPORT = 20,
     TRAY_CMD_OVERLAY_BASE = 1000,
     TRAY_CMD_GROUP_BASE = 1000000,   /* + group index * 4 + action */
-    TRAY_CMD_MASTER_BASE = 2000000   /* + master overlay id */
+    TRAY_CMD_LEADER_BASE = 2000000   /* + leader overlay id */
 };
 #define GROUP_ACTION_HIDE 0
 #define GROUP_ACTION_REMOVE 1
@@ -213,7 +213,7 @@ static void add_overlay_from_path(const wchar_t *path, void *ctx)
 #define RESTORE_MAX 256
 typedef struct RestoreItem {
     Overlay *o;
-    uint64_t master_uid;
+    uint64_t leader_uid;
 } RestoreItem;
 static RestoreItem s_restore[RESTORE_MAX];
 static int s_restore_n;
@@ -252,7 +252,7 @@ static void restore_overlay(const OverlayConfig *cfg, void *ctx)
     if (cfg->group_uid) o->group = group_find_uid(cfg->group_uid);
     link_overlay(o);
     s_restore[s_restore_n].o = o;
-    s_restore[s_restore_n].master_uid = cfg->master_uid;
+    s_restore[s_restore_n].leader_uid = cfg->leader_uid;
     ++s_restore_n;
     ++s_restored;
 }
@@ -261,20 +261,20 @@ static void finish_restore(void)
 {
     for (int i = 0; i < s_restore_n; ++i) {
         Overlay *o = s_restore[i].o;
-        if (!s_restore[i].master_uid) continue;
-        Overlay *master = NULL;
+        if (!s_restore[i].leader_uid) continue;
+        Overlay *leader = NULL;
         for (int j = 0; j < s_restore_n; ++j) {
-            if (s_restore[j].o->uid == s_restore[i].master_uid) {
-                master = s_restore[j].o;
+            if (s_restore[j].o->uid == s_restore[i].leader_uid) {
+                leader = s_restore[j].o;
                 break;
             }
         }
-        if (master && master != o && !master->master && !overlay_has_slaves(o))
-            o->master = master;
+        if (leader && leader != o && !leader->leader && !overlay_has_followers(o))
+            o->leader = leader;
     }
     for (int i = 0; i < s_restore_n; ++i) {
         Overlay *o = s_restore[i].o;
-        if (!o->master && o->script_spec && *o->script_spec) overlay_set_script(o, o->script_spec);
+        if (!o->leader && o->script_spec && *o->script_spec) overlay_set_script(o, o->script_spec);
         overlay_refresh_visibility(o);
     }
     Group *g = g_app.groups;
@@ -294,7 +294,7 @@ void app_remove_overlay(Overlay *o)
         g_app.pick_id = 0;
     }
     Group *group = o->group;
-    if (overlay_has_slaves(o)) overlay_master_removed(o);
+    if (overlay_has_followers(o)) overlay_leader_removed(o);
     for (Overlay **p = &g_app.overlays; *p; p = &(*p)->next) {
         if (*p == o) {
             *p = o->next;
@@ -929,8 +929,8 @@ static void clear_config(void)
         g_app.persist = false;
         while (g_app.groups) group_destroy(g_app.groups);
         for (Overlay *o = g_app.overlays; o; o = o->next) {
-            if (o->master) {
-                o->master = NULL;
+            if (o->leader) {
+                o->leader = NULL;
                 if (o->script_spec && *o->script_spec) overlay_set_script(o, o->script_spec);
             }
         }
@@ -1003,11 +1003,11 @@ static void show_tray_menu(void)
     UINT cmd = app_track_menu(menu, pt.x, pt.y);
     DestroyMenu(menu);
 
-    if (cmd >= OVERLAY_MASTER_CMD_BASE) {
-        overlay_master_command(cmd);
+    if (cmd >= OVERLAY_LEADER_CMD_BASE) {
+        overlay_leader_command(cmd);
         return;
     }
-    if (cmd >= TRAY_CMD_GROUP_BASE && cmd < TRAY_CMD_MASTER_BASE) {
+    if (cmd >= TRAY_CMD_GROUP_BASE && cmd < TRAY_CMD_LEADER_BASE) {
         UINT rel = cmd - TRAY_CMD_GROUP_BASE;
         UINT target = rel / GROUP_MENU_SPAN;
         UINT action = rel % GROUP_MENU_SPAN;

@@ -24,9 +24,9 @@ typedef struct ScriptPeer {
     int hw, hh;
     bool scripted, paused;
     bool still;             /* PNG/JPG/JPEG, no animation. */
-    bool controlled;        /* Slave of another overlay. */
-    bool master;            /* Has at least one slave. */
-    int master_id;          /* 0 unless controlled. */
+    bool follower;        /* Follower of another overlay. */
+    bool leader;            /* Has at least one follower. */
+    int leader_id;          /* 0 unless controlled. */
     const char *name;       /* UTF-8 media file name, owned by the host. */
 } ScriptPeer;
 
@@ -104,16 +104,16 @@ typedef struct ScriptPlay {
 typedef enum ScriptEasing { SEASE_LINEAR, SEASE_IN, SEASE_OUT, SEASE_IN_OUT } ScriptEasing;
 typedef enum ScriptCursor { SCURSOR_MOVE, SCURSOR_ARROW, SCURSOR_HAND, SCURSOR_NONE } ScriptCursor;
 
-/* Direct slaves of the script's overlay, plus target state used by the
- * chainable slave handles. The host returns an Overlay* as `target`. */
-typedef struct ScriptSlaveOps {
-    int (*list)(void *master_ctx, int *ids, int cap);
-    void *(*resolve)(void *master_ctx, int id);
-    const char *(*name)(void *master_ctx, int id);
+/* Direct followers of the script's overlay, plus target state used by the
+ * chainable follower handles. The host returns an Overlay* as `target`. */
+typedef struct ScriptFollowerOps {
+    int (*list)(void *leader_ctx, int *ids, int cap);
+    void *(*resolve)(void *leader_ctx, int id);
+    const char *(*name)(void *leader_ctx, int id);
     bool (*get_hidden)(void *target);
     bool (*get_paused)(void *target);
     bool (*is_static)(void *target);
-} ScriptSlaveOps;
+} ScriptFollowerOps;
 
 typedef struct ScriptHostExtOps {
     /* Clips. Errors are UTF-8 messages for the script (returned as nil, err). */
@@ -146,7 +146,7 @@ typedef struct ScriptHostExtOps {
     bool (*is_static)(void *ctx);
     void (*set_hidden)(void *ctx, bool hidden);
     void (*set_paused)(void *ctx, bool paused);
-    const ScriptSlaveOps *slaves;
+    const ScriptFollowerOps *followers;
 } ScriptHostExtOps;
 
 typedef struct Script Script;

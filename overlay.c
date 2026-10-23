@@ -93,7 +93,7 @@ static bool overlay_effective_hidden(const Overlay *o)
 
 static bool script_live(const Overlay *o)
 {
-    return o->script && !o->master && !overlay_effective_hidden(o) && !o->paused && !o->scaling;
+    return o->script && !o->leader && !overlay_effective_hidden(o) && !o->paused && !o->scaling;
 }
 
 bool overlay_is_animating(const Overlay *o)
@@ -694,9 +694,9 @@ static void fill_peer(const Overlay *o, ScriptPeer *p)
     p->scripted = o->script != NULL;
     p->paused = o->paused;
     p->still = o->still_image;
-    p->controlled = o->master != NULL;
-    p->master = overlay_has_slaves(o);
-    p->master_id = o->master ? o->master->id : 0;
+    p->follower = o->leader != NULL;
+    p->leader = overlay_has_followers(o);
+    p->leader_id = o->leader ? o->leader->id : 0;
     p->name = o->name_u8 ? o->name_u8 : "";
 }
 
@@ -722,34 +722,34 @@ static const ScriptHostOps HOST_OPS = {host_get_rect, host_set_pos, host_set_fli
 
 static Overlay *find_overlay(int id);
 
-static int slave_list(void *ctx, int *ids, int cap)
+static int follower_list(void *ctx, int *ids, int cap)
 {
-    Overlay *master = (Overlay *)ctx;
+    Overlay *leader = (Overlay *)ctx;
     int n = 0;
     for (Overlay *o = g_app.overlays; o && n < cap; o = o->next) {
-        if (o->master == master) ids[n++] = o->id;
+        if (o->leader == leader) ids[n++] = o->id;
     }
     return n;
 }
 
-static void *slave_resolve(void *ctx, int id)
+static void *follower_resolve(void *ctx, int id)
 {
     Overlay *o = find_overlay(id);
-    return o && o->master == (Overlay *)ctx ? o : NULL;
+    return o && o->leader == (Overlay *)ctx ? o : NULL;
 }
 
-static const char *slave_name(void *ctx, int id)
+static const char *follower_name(void *ctx, int id)
 {
-    Overlay *o = (Overlay *)slave_resolve(ctx, id);
+    Overlay *o = (Overlay *)follower_resolve(ctx, id);
     return o ? (o->name_u8 ? o->name_u8 : "") : NULL;
 }
 
-static bool slave_hidden(void *target) { return ((Overlay *)target)->hidden; }
-static bool slave_paused(void *target) { return ((Overlay *)target)->paused; }
-static bool slave_static(void *target) { return ((Overlay *)target)->still_image; }
+static bool follower_hidden(void *target) { return ((Overlay *)target)->hidden; }
+static bool follower_paused(void *target) { return ((Overlay *)target)->paused; }
+static bool follower_static(void *target) { return ((Overlay *)target)->still_image; }
 
-static const ScriptSlaveOps SLAVE_OPS = {slave_list, slave_resolve, slave_name,
-                                         slave_hidden, slave_paused, slave_static};
+static const ScriptFollowerOps FOLLOWER_OPS = {follower_list, follower_resolve, follower_name,
+                                         follower_hidden, follower_paused, follower_static};
 
 /* ---- extended host ops: clips, playback, composition, input behaviour ---- */
 
@@ -1054,7 +1054,7 @@ static const ScriptHostExtOps HOST_EXT = {
     xhost_load_clip, xhost_unload_clip, xhost_clip_info, xhost_play, xhost_seek, xhost_get_frame,
     xhost_set_speed, xhost_set_playing, xhost_set_matrix, xhost_set_opacity, xhost_set_cursor,
     xhost_set_draggable, xhost_set_clickthrough, xhost_subs_changed, xhost_now, xhost_notify,
-    xhost_is_static, xhost_set_hidden, xhost_set_paused, &SLAVE_OPS,
+    xhost_is_static, xhost_set_hidden, xhost_set_paused, &FOLLOWER_OPS,
 };
 
 /* ---- script lifecycle and calls -------------------------------------------- */
@@ -1193,8 +1193,8 @@ void overlay_set_script(Overlay *o, const wchar_t *spec)
     o->script_failed = false;
     free(o->script_spec);
     o->script_spec = copy;
-    if (o->master) {
-        /* A slave's own script stays dormant; only the master may control it. */
+    if (o->leader) {
+        /* A follower's own script stays dormant; only the leader may control it. */
         script_destroy(o->script);
         o->script = NULL;
         o->subs = 0;
@@ -1249,70 +1249,70 @@ void overlay_set_script(Overlay *o, const wchar_t *spec)
     app_reschedule();
 }
 
-bool overlay_has_slaves(const Overlay *o)
+bool overlay_has_followers(const Overlay *o)
 {
     if (!o) return false;
     for (const Overlay *q = g_app.overlays; q; q = q->next) {
-        if (q->master == o) return true;
+        if (q->leader == o) return true;
     }
     return false;
 }
 
-bool overlay_bind_master(Overlay *slave, Overlay *master, wchar_t *err, size_t cap)
+bool overlay_bind_leader(Overlay *follower, Overlay *leader, wchar_t *err, size_t cap)
 {
     if (err && cap) err[0] = 0;
-    if (!slave || !master || slave == master) {
-        if (err) _snwprintf_s(err, cap, _TRUNCATE, TXT_MASTER_CYCLE);
+    if (!follower || !leader || follower == leader) {
+        if (err) _snwprintf_s(err, cap, _TRUNCATE, TXT_LEADER_CYCLE);
         return false;
     }
-    if (slave->master == master) return true;
-    if (master->master) {
-        if (err) _snwprintf_s(err, cap, _TRUNCATE, TXT_MASTER_CHAIN_ERROR);
+    if (follower->leader == leader) return true;
+    if (leader->leader) {
+        if (err) _snwprintf_s(err, cap, _TRUNCATE, TXT_LEADER_CHAIN_ERROR);
         return false;
     }
-    if (overlay_has_slaves(slave)) {
-        if (err) _snwprintf_s(err, cap, _TRUNCATE, TXT_MASTER_CHAIN_ERROR);
+    if (overlay_has_followers(follower)) {
+        if (err) _snwprintf_s(err, cap, _TRUNCATE, TXT_LEADER_CHAIN_ERROR);
         return false;
     }
-    for (Overlay *m = master; m; m = m->master) {
-        if (m == slave) {
-            if (err) _snwprintf_s(err, cap, _TRUNCATE, TXT_MASTER_CYCLE);
+    for (Overlay *m = leader; m; m = m->leader) {
+        if (m == follower) {
+            if (err) _snwprintf_s(err, cap, _TRUNCATE, TXT_LEADER_CYCLE);
             return false;
         }
     }
-    script_destroy(slave->script);
-    slave->script = NULL;
-    slave->subs = 0;
-    slave->script_failed = false;
-    slave->next_timer = INT64_MAX;
-    slave->master = master;
+    script_destroy(follower->script);
+    follower->script = NULL;
+    follower->subs = 0;
+    follower->script_failed = false;
+    follower->next_timer = INT64_MAX;
+    follower->leader = leader;
     peers_changed();
     overlay_refresh_hook();
     app_changed();
     char u8[MAX_PATH * 4];
-    log_info("GIF #%d is now controlled by #%d (%s)", slave->id, master->id,
-             applog_u8(overlay_name(master), u8, sizeof(u8)));
+    log_info("GIF #%d is now controlled by #%d (%s)", follower->id, leader->id,
+             applog_u8(overlay_name(leader), u8, sizeof(u8)));
     return true;
 }
 
-void overlay_unbind_master(Overlay *slave, bool reload_script)
+void overlay_unbind_leader(Overlay *follower, bool reload_script)
 {
-    if (!slave || !slave->master) return;
-    slave->master = NULL;
-    if (reload_script && slave->script_spec && *slave->script_spec)
-        overlay_set_script(slave, slave->script_spec);
+    if (!follower || !follower->leader) return;
+    follower->leader = NULL;
+    if (reload_script && follower->script_spec && *follower->script_spec)
+        overlay_set_script(follower, follower->script_spec);
     peers_changed();
     overlay_refresh_hook();
     app_changed();
 }
 
-void overlay_master_removed(Overlay *master)
+void overlay_leader_removed(Overlay *leader)
 {
-    if (!master) return;
+    if (!leader) return;
     bool changed = false;
     for (Overlay *o = g_app.overlays; o; o = o->next) {
-        if (o->master != master) continue;
-        o->master = NULL;
+        if (o->leader != leader) continue;
+        o->leader = NULL;
         changed = true;
         if (!g_app.shutting_down && o->script_spec && *o->script_spec)
             overlay_set_script(o, o->script_spec);
@@ -2336,8 +2336,8 @@ void overlay_command(Overlay *o, UINT cmd)
         overlay_set_hidden(o, !o->hidden);
         if (o->hidden) app_notify(TXT_HIDDEN_TITLE, TXT_HIDDEN_TEXT);
         break;
-    case OVERLAY_CMD_MASTER_NONE:
-        overlay_unbind_master(o, true);
+    case OVERLAY_CMD_LEADER_NONE:
+        overlay_unbind_leader(o, true);
         break;
     case OVERLAY_CMD_RECENTER:
         center_on_primary(o, 0);
@@ -2441,37 +2441,37 @@ void overlay_command(Overlay *o, UINT cmd)
     app_changed();
 }
 
-#define MASTER_ID_SPAN 100000
-void overlay_master_command(UINT cmd)
+#define LEADER_ID_SPAN 100000
+void overlay_leader_command(UINT cmd)
 {
-    if (cmd < OVERLAY_MASTER_CMD_BASE) return;
-    UINT packed = cmd - OVERLAY_MASTER_CMD_BASE;
-    Overlay *slave = find_overlay((int)(packed / MASTER_ID_SPAN));
-    Overlay *master = find_overlay((int)(packed % MASTER_ID_SPAN));
-    if (!slave || !master) return;
+    if (cmd < OVERLAY_LEADER_CMD_BASE) return;
+    UINT packed = cmd - OVERLAY_LEADER_CMD_BASE;
+    Overlay *follower = find_overlay((int)(packed / LEADER_ID_SPAN));
+    Overlay *leader = find_overlay((int)(packed % LEADER_ID_SPAN));
+    if (!follower || !leader) return;
     wchar_t err[256];
-    if (!overlay_bind_master(slave, master, err, ARRAYSIZE(err)))
-        app_notify(TXT_MENU_MASTER, err);
+    if (!overlay_bind_leader(follower, leader, err, ARRAYSIZE(err)))
+        app_notify(TXT_MENU_LEADER, err);
 }
 
 void overlay_build_menu(const Overlay *o, HMENU menu, UINT base)
 {
-    HMENU master = CreatePopupMenu();
-    if (master) {
-        AppendMenuW(master, MF_STRING | (o->master ? 0 : MF_CHECKED), base + OVERLAY_CMD_MASTER_NONE,
-                    TXT_MENU_MASTER_NONE);
-        if (overlay_has_slaves(o)) {
-            AppendMenuW(master, MF_STRING | MF_GRAYED, 0, TXT_MENU_MASTER_CHAIN);
+    HMENU leader = CreatePopupMenu();
+    if (leader) {
+        AppendMenuW(leader, MF_STRING | (o->leader ? 0 : MF_CHECKED), base + OVERLAY_CMD_LEADER_NONE,
+                    TXT_MENU_LEADER_NONE);
+        if (overlay_has_followers(o)) {
+            AppendMenuW(leader, MF_STRING | MF_GRAYED, 0, TXT_MENU_LEADER_CHAIN);
         } else {
             for (Overlay *cand = g_app.overlays; cand; cand = cand->next) {
-                if (cand == o || cand->master) continue;
+                if (cand == o || cand->leader) continue;
                 wchar_t label[MAX_PATH + 32];
                 _snwprintf_s(label, ARRAYSIZE(label), _TRUNCATE, L"%s  #%d", overlay_name(cand), cand->id);
-                AppendMenuW(master, MF_STRING | (o->master == cand ? MF_CHECKED : 0),
-                            OVERLAY_MASTER_CMD_BASE + (UINT)o->id * MASTER_ID_SPAN + (UINT)cand->id, label);
+                AppendMenuW(leader, MF_STRING | (o->leader == cand ? MF_CHECKED : 0),
+                            OVERLAY_LEADER_CMD_BASE + (UINT)o->id * LEADER_ID_SPAN + (UINT)cand->id, label);
             }
         }
-        AppendMenuW(menu, MF_POPUP | (o->master ? MF_CHECKED : 0), (UINT_PTR)master, TXT_MENU_MASTER);
+        AppendMenuW(menu, MF_POPUP | (o->leader ? MF_CHECKED : 0), (UINT_PTR)leader, TXT_MENU_LEADER);
     }
     HMENU key = CreatePopupMenu();
     if (key) {
@@ -2523,9 +2523,9 @@ void overlay_build_menu(const Overlay *o, HMENU menu, UINT base)
                     base + OVERLAY_CMD_SCALE, label);
     }
     if (key) AppendMenuW(menu, MF_POPUP | (o->key_enabled ? MF_CHECKED : 0), (UINT_PTR)key, TXT_MENU_COLOR_KEY);
-    if (o->master) {
+    if (o->leader) {
         if (motion) DestroyMenu(motion);
-        AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, TXT_MENU_SCRIPT_SLAVE);
+        AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, TXT_MENU_SCRIPT_FOLLOWER);
     } else if (motion) {
         bool on = o->script_spec && *o->script_spec;
         AppendMenuW(menu, MF_POPUP | (on ? MF_CHECKED : 0), (UINT_PTR)motion, TXT_MENU_SCRIPT);
@@ -2560,7 +2560,7 @@ void overlay_to_config(const Overlay *o, OverlayConfig *out)
     out->key_tolerance = o->key_tolerance;
     out->script = o->script_spec ? o->script_spec : L"";
     out->uid = o->uid;
-    out->master_uid = o->master ? o->master->uid : 0;
+    out->leader_uid = o->leader ? o->leader->uid : 0;
     out->group_uid = o->group ? o->group->uid : 0;
     out->defer_script = false;
 }

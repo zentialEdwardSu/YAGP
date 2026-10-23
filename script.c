@@ -320,7 +320,7 @@ static int l_fits(lua_State *L)
 }
 
 /* { id, name, x, y, w, h, hx, hy, hw, hh, cx, cy, vx, vy, scripted, paused,
- *   still, controlled, master, master_id } */
+ *   still, controlled, leader, leader_id } */
 static void push_peer(lua_State *L, const ScriptPeer *p)
 {
     lua_createtable(L, 0, 20);
@@ -341,9 +341,9 @@ static void push_peer(lua_State *L, const ScriptPeer *p)
     lua_pushboolean(L, p->scripted);             lua_setfield(L, -2, "scripted");
     lua_pushboolean(L, p->paused);               lua_setfield(L, -2, "paused");
     lua_pushboolean(L, p->still);                 lua_setfield(L, -2, "still");
-    lua_pushboolean(L, p->controlled);            lua_setfield(L, -2, "controlled");
-    lua_pushboolean(L, p->master);                lua_setfield(L, -2, "master");
-    lua_pushinteger(L, p->master_id);             lua_setfield(L, -2, "master_id");
+    lua_pushboolean(L, p->follower);            lua_setfield(L, -2, "follower");
+    lua_pushboolean(L, p->leader);                lua_setfield(L, -2, "leader");
+    lua_pushinteger(L, p->leader_id);             lua_setfield(L, -2, "leader_id");
 }
 
 static int read_peers(Script *s, ScriptPeer *out)
@@ -1365,84 +1365,84 @@ static int l_set_clickthrough(lua_State *L)
     return 0;
 }
 
-/* ---- chainable slave handles ---------------------------------------------- */
+/* ---- chainable follower handles ---------------------------------------------- */
 
-typedef struct SlaveHandle {
+typedef struct FollowerHandle {
     int id;
-} SlaveHandle;
+} FollowerHandle;
 
-#define SLAVE_MT "YAGP_SLAVE"
-#define SLAVE_MAX 64
+#define FOLLOWER_MT "YAGP_FOLLOWER"
+#define FOLLOWER_MAX 64
 
-static const ScriptSlaveOps *slave_api(Script *s)
+static const ScriptFollowerOps *follower_api(Script *s)
 {
-    return s && s->ext ? s->ext->slaves : NULL;
+    return s && s->ext ? s->ext->followers : NULL;
 }
 
-static void *slave_target(lua_State *L, Script **out)
+static void *follower_target(lua_State *L, Script **out)
 {
-    SlaveHandle *h = (SlaveHandle *)luaL_checkudata(L, 1, SLAVE_MT);
+    FollowerHandle *h = (FollowerHandle *)luaL_checkudata(L, 1, FOLLOWER_MT);
     Script *s = self(L);
     *out = s;
-    const ScriptSlaveOps *ops = slave_api(s);
+    const ScriptFollowerOps *ops = follower_api(s);
     return ops && ops->resolve ? ops->resolve(s->ctx, h->id) : NULL;
 }
 
-static int slave_self(lua_State *L)
+static int follower_self(lua_State *L)
 {
     lua_pushvalue(L, 1);
     return 1;
 }
 
-static int slave_nil(lua_State *L)
+static int follower_nil(lua_State *L)
 {
     lua_pushnil(L);
     return 1;
 }
 
-static bool slave_static_target(lua_State *L, Script *s, void *target)
+static bool follower_static_target(lua_State *L, Script *s, void *target)
 {
     (void)L;
-    const ScriptSlaveOps *ops = slave_api(s);
+    const ScriptFollowerOps *ops = follower_api(s);
     return ops && ops->is_static && ops->is_static(target);
 }
 
-static void push_slave(lua_State *L, int id)
+static void push_follower(lua_State *L, int id)
 {
-    SlaveHandle *h = (SlaveHandle *)lua_newuserdatauv(L, sizeof(*h), 0);
+    FollowerHandle *h = (FollowerHandle *)lua_newuserdatauv(L, sizeof(*h), 0);
     h->id = id;
-    luaL_setmetatable(L, SLAVE_MT);
+    luaL_setmetatable(L, FOLLOWER_MT);
 }
 
-static int l_slave(lua_State *L)
+static int l_follower(lua_State *L)
 {
     Script *s = self(L);
     int id = (int)luaL_checkinteger(L, 1);
-    const ScriptSlaveOps *ops = slave_api(s);
-    if (!ops || !ops->resolve || !ops->resolve(s->ctx, id)) return slave_nil(L);
-    push_slave(L, id);
+    const ScriptFollowerOps *ops = follower_api(s);
+    if (!ops || !ops->resolve || !ops->resolve(s->ctx, id)) return follower_nil(L);
+    push_follower(L, id);
     return 1;
 }
 
-static int l_slaves(lua_State *L)
+static int l_followers(lua_State *L)
 {
     Script *s = self(L);
-    const ScriptSlaveOps *ops = slave_api(s);
-    int ids[SLAVE_MAX];
-    int n = ops && ops->list ? ops->list(s->ctx, ids, SLAVE_MAX) : 0;
+    const ScriptFollowerOps *ops = follower_api(s);
+    int ids[FOLLOWER_MAX];
+    int n = ops && ops->list ? ops->list(s->ctx, ids, FOLLOWER_MAX) : 0;
     lua_createtable(L, n, 0);
     for (int i = 0; i < n; ++i) {
-        push_slave(L, ids[i]);
+        push_follower(L, ids[i]);
         lua_rawseti(L, -2, i + 1);
     }
     return 1;
 }
 
-static int slave_pos(lua_State *L)
+static int follower_pos(lua_State *L)
 {
     Script *s;
-    void *t = slave_target(L, &s);
-    if (!t) return slave_nil(L);
+    void *t = follower_target(L, &s);
+    if (!t) return follower_nil(L);
     double x, y;
     int w, h;
     s->ops->get_rect(t, &x, &y, &w, &h);
@@ -1451,11 +1451,11 @@ static int slave_pos(lua_State *L)
     return 2;
 }
 
-static int slave_size(lua_State *L)
+static int follower_size(lua_State *L)
 {
     Script *s;
-    void *t = slave_target(L, &s);
-    if (!t) return slave_nil(L);
+    void *t = follower_target(L, &s);
+    if (!t) return follower_nil(L);
     double x, y;
     int w, h;
     s->ops->get_rect(t, &x, &y, &w, &h);
@@ -1464,11 +1464,11 @@ static int slave_size(lua_State *L)
     return 2;
 }
 
-static int slave_center(lua_State *L)
+static int follower_center(lua_State *L)
 {
     Script *s;
-    void *t = slave_target(L, &s);
-    if (!t) return slave_nil(L);
+    void *t = follower_target(L, &s);
+    if (!t) return follower_nil(L);
     double x, y;
     int w, h, dx, dy, hw, hh;
     s->ops->get_rect(t, &x, &y, &w, &h);
@@ -1478,11 +1478,11 @@ static int slave_center(lua_State *L)
     return 2;
 }
 
-static int slave_hitbox(lua_State *L)
+static int follower_hitbox(lua_State *L)
 {
     Script *s;
-    void *t = slave_target(L, &s);
-    if (!t) return slave_nil(L);
+    void *t = follower_target(L, &s);
+    if (!t) return follower_nil(L);
     int dx, dy, w, h;
     s->ops->get_hitbox(t, &dx, &dy, &w, &h);
     lua_pushinteger(L, dx);
@@ -1492,19 +1492,19 @@ static int slave_hitbox(lua_State *L)
     return 4;
 }
 
-static int slave_set_pos(lua_State *L)
+static int follower_set_pos(lua_State *L)
 {
     Script *s;
-    void *t = slave_target(L, &s);
+    void *t = follower_target(L, &s);
     double x = check_coord(L, 2), y = check_coord(L, 3);
     if (t) s->ops->set_pos(t, x, y);
-    return slave_self(L);
+    return follower_self(L);
 }
 
-static int slave_move(lua_State *L)
+static int follower_move(lua_State *L)
 {
     Script *s;
-    void *t = slave_target(L, &s);
+    void *t = follower_target(L, &s);
     double dx = check_coord(L, 2), dy = check_coord(L, 3);
     if (t) {
         double x, y;
@@ -1512,21 +1512,21 @@ static int slave_move(lua_State *L)
         s->ops->get_rect(t, &x, &y, &w, &h);
         s->ops->set_pos(t, x + dx, y + dy);
     }
-    return slave_self(L);
+    return follower_self(L);
 }
 
-static int slave_set_flip(lua_State *L)
+static int follower_set_flip(lua_State *L)
 {
     Script *s;
-    void *t = slave_target(L, &s);
+    void *t = follower_target(L, &s);
     if (t) s->ops->set_flip(t, lua_toboolean(L, 2));
-    return slave_self(L);
+    return follower_self(L);
 }
 
-static int slave_set_hitbox(lua_State *L)
+static int follower_set_hitbox(lua_State *L)
 {
     Script *s;
-    void *t = slave_target(L, &s);
+    void *t = follower_target(L, &s);
     if (t && s->ops->set_hitbox) {
         if (lua_isnoneornil(L, 2)) {
             s->ops->set_hitbox(t, NULL);
@@ -1537,104 +1537,104 @@ static int slave_set_hitbox(lua_State *L)
             s->ops->set_hitbox(t, box);
         }
     }
-    return slave_self(L);
+    return follower_self(L);
 }
 
-static int slave_name(lua_State *L)
+static int follower_name(lua_State *L)
 {
-    SlaveHandle *h = (SlaveHandle *)luaL_checkudata(L, 1, SLAVE_MT);
+    FollowerHandle *h = (FollowerHandle *)luaL_checkudata(L, 1, FOLLOWER_MT);
     Script *s = self(L);
-    const ScriptSlaveOps *ops = slave_api(s);
+    const ScriptFollowerOps *ops = follower_api(s);
     const char *name = ops && ops->name ? ops->name(s->ctx, h->id) : NULL;
     if (name) lua_pushstring(L, name);
     else lua_pushnil(L);
     return 1;
 }
 
-static int slave_id(lua_State *L)
+static int follower_id(lua_State *L)
 {
-    SlaveHandle *h = (SlaveHandle *)luaL_checkudata(L, 1, SLAVE_MT);
+    FollowerHandle *h = (FollowerHandle *)luaL_checkudata(L, 1, FOLLOWER_MT);
     lua_pushinteger(L, h->id);
     return 1;
 }
 
-static int slave_paused(lua_State *L)
+static int follower_paused(lua_State *L)
 {
     Script *s;
-    void *t = slave_target(L, &s);
-    const ScriptSlaveOps *ops = slave_api(s);
+    void *t = follower_target(L, &s);
+    const ScriptFollowerOps *ops = follower_api(s);
     if (t && ops && ops->get_paused) lua_pushboolean(L, ops->get_paused(t));
     else lua_pushnil(L);
     return 1;
 }
 
-static int slave_hidden(lua_State *L)
+static int follower_hidden(lua_State *L)
 {
     Script *s;
-    void *t = slave_target(L, &s);
-    const ScriptSlaveOps *ops = slave_api(s);
+    void *t = follower_target(L, &s);
+    const ScriptFollowerOps *ops = follower_api(s);
     if (t && ops && ops->get_hidden) lua_pushboolean(L, ops->get_hidden(t));
     else lua_pushnil(L);
     return 1;
 }
 
-static int slave_hide(lua_State *L)
+static int follower_hide(lua_State *L)
 {
     Script *s;
-    void *t = slave_target(L, &s);
+    void *t = follower_target(L, &s);
     if (t && s->ext && s->ext->set_hidden) s->ext->set_hidden(t, true);
-    return slave_self(L);
+    return follower_self(L);
 }
 
-static int slave_show(lua_State *L)
+static int follower_show(lua_State *L)
 {
     Script *s;
-    void *t = slave_target(L, &s);
+    void *t = follower_target(L, &s);
     if (t && s->ext && s->ext->set_hidden) s->ext->set_hidden(t, false);
-    return slave_self(L);
+    return follower_self(L);
 }
 
-static int slave_set_paused(lua_State *L)
+static int follower_set_paused(lua_State *L)
 {
     Script *s;
-    void *t = slave_target(L, &s);
-    if (!t) return slave_self(L);
-    if (slave_static_target(L, s, t)) return fail_with(L, TXT_U8_STATIC_NO_ANIM);
+    void *t = follower_target(L, &s);
+    if (!t) return follower_self(L);
+    if (follower_static_target(L, s, t)) return fail_with(L, TXT_U8_STATIC_NO_ANIM);
     if (s->ext && s->ext->set_paused) s->ext->set_paused(t, lua_toboolean(L, 2));
-    return slave_self(L);
+    return follower_self(L);
 }
 
-static int slave_clip(lua_State *L)
+static int follower_clip(lua_State *L)
 {
     Script *s;
-    void *t = slave_target(L, &s);
-    if (!t) return slave_self(L);
-    if (slave_static_target(L, s, t)) return fail_with(L, TXT_U8_STATIC_NO_ANIM);
+    void *t = follower_target(L, &s);
+    if (!t) return follower_self(L);
+    if (follower_static_target(L, s, t)) return fail_with(L, TXT_U8_STATIC_NO_ANIM);
     const char *name = check_clip_name(L, 2);
     const char *rel = luaL_checkstring(L, 3);
     if (!s->ext || !s->ext->load_clip) return fail_with(L, TXT_U8_UNAVAILABLE);
     char err[256] = "";
     if (!s->ext->load_clip(t, name, rel, err, sizeof(err))) return fail_with(L, err);
-    return slave_self(L);
+    return follower_self(L);
 }
 
-static int slave_unload(lua_State *L)
+static int follower_unload(lua_State *L)
 {
     Script *s;
-    void *t = slave_target(L, &s);
-    if (!t) return slave_self(L);
-    if (slave_static_target(L, s, t)) return fail_with(L, TXT_U8_STATIC_NO_ANIM);
+    void *t = follower_target(L, &s);
+    if (!t) return follower_self(L);
+    if (follower_static_target(L, s, t)) return fail_with(L, TXT_U8_STATIC_NO_ANIM);
     const char *name = check_clip_name(L, 2);
     if (s->ext && s->ext->unload_clip) s->ext->unload_clip(t, name);
-    return slave_self(L);
+    return follower_self(L);
 }
 
-static int slave_play(lua_State *L)
+static int follower_play(lua_State *L)
 {
     Script *s;
-    void *t = slave_target(L, &s);
-    if (!t) return slave_self(L);
-    if (slave_static_target(L, s, t)) return fail_with(L, TXT_U8_STATIC_NO_ANIM);
+    void *t = follower_target(L, &s);
+    if (!t) return follower_self(L);
+    if (follower_static_target(L, s, t)) return fail_with(L, TXT_U8_STATIC_NO_ANIM);
     const char *name = check_clip_name(L, 2);
     int opts = lua_isnoneornil(L, 3) ? 0 : 3;
     if (opts) luaL_checktype(L, opts, LUA_TTABLE);
@@ -1665,28 +1665,28 @@ static int slave_play(lua_State *L)
     char err[256] = "";
     if (!s->ext || !s->ext->play) return fail_with(L, TXT_U8_UNAVAILABLE);
     if (!s->ext->play(t, name, &p, err, sizeof(err))) return fail_with(L, err);
-    return slave_self(L);
+    return follower_self(L);
 }
 
-static int slave_seek(lua_State *L)
+static int follower_seek(lua_State *L)
 {
     Script *s;
-    void *t = slave_target(L, &s);
-    if (!t) return slave_self(L);
-    if (slave_static_target(L, s, t)) return fail_with(L, TXT_U8_STATIC_NO_ANIM);
+    void *t = follower_target(L, &s);
+    if (!t) return follower_self(L);
+    if (follower_static_target(L, s, t)) return fail_with(L, TXT_U8_STATIC_NO_ANIM);
     lua_Integer f = luaL_checkinteger(L, 2);
     luaL_argcheck(L, f >= 1 && f <= 65535, 2, TXT_U8_BAD_RANGE);
     if (!s->ext || !s->ext->seek || !s->ext->seek(t, (int)f - 1))
         return fail_with(L, TXT_U8_BAD_RANGE);
-    return slave_self(L);
+    return follower_self(L);
 }
 
-static int slave_frame(lua_State *L)
+static int follower_frame(lua_State *L)
 {
     Script *s;
-    void *t = slave_target(L, &s);
-    if (!t) return slave_nil(L);
-    if (slave_static_target(L, s, t)) return fail_with(L, TXT_U8_STATIC_NO_ANIM);
+    void *t = follower_target(L, &s);
+    if (!t) return follower_nil(L);
+    if (follower_static_target(L, s, t)) return fail_with(L, TXT_U8_STATIC_NO_ANIM);
     const char *name = "main";
     int frame = 0, frames = 0;
     if (s->ext && s->ext->get_frame) s->ext->get_frame(t, &name, &frame, &frames);
@@ -1697,16 +1697,16 @@ static int slave_frame(lua_State *L)
     return 3;
 }
 
-static int slave_clip_info(lua_State *L)
+static int follower_clip_info(lua_State *L)
 {
     Script *s;
-    void *t = slave_target(L, &s);
-    if (!t) return slave_nil(L);
-    if (slave_static_target(L, s, t)) return slave_nil(L);
+    void *t = follower_target(L, &s);
+    if (!t) return follower_nil(L);
+    if (follower_static_target(L, s, t)) return follower_nil(L);
     const char *name = check_clip_name(L, 2);
     ScriptClipInfo ci;
     memset(&ci, 0, sizeof(ci));
-    if (!s->ext || !s->ext->clip_info || !s->ext->clip_info(t, name, &ci)) return slave_nil(L);
+    if (!s->ext || !s->ext->clip_info || !s->ext->clip_info(t, name, &ci)) return follower_nil(L);
     lua_createtable(L, 0, 6);
     int tab = lua_gettop(L);
     set_int(L, tab, "w", ci.w);
@@ -1727,33 +1727,33 @@ static int slave_clip_info(lua_State *L)
     return 1;
 }
 
-static int slave_set_speed(lua_State *L)
+static int follower_set_speed(lua_State *L)
 {
     Script *s;
-    void *t = slave_target(L, &s);
-    if (!t) return slave_self(L);
-    if (slave_static_target(L, s, t)) return fail_with(L, TXT_U8_STATIC_NO_ANIM);
+    void *t = follower_target(L, &s);
+    if (!t) return follower_self(L);
+    if (follower_static_target(L, s, t)) return fail_with(L, TXT_U8_STATIC_NO_ANIM);
     double v = luaL_checknumber(L, 2);
     luaL_argcheck(L, v >= 0.1 && v <= 10, 2, TXT_U8_BAD_RANGE);
     if (s->ext && s->ext->set_speed) s->ext->set_speed(t, v);
-    return slave_self(L);
+    return follower_self(L);
 }
 
-static int slave_set_playing(lua_State *L)
+static int follower_set_playing(lua_State *L)
 {
     Script *s;
-    void *t = slave_target(L, &s);
-    if (!t) return slave_self(L);
-    if (slave_static_target(L, s, t)) return fail_with(L, TXT_U8_STATIC_NO_ANIM);
+    void *t = follower_target(L, &s);
+    if (!t) return follower_self(L);
+    if (follower_static_target(L, s, t)) return fail_with(L, TXT_U8_STATIC_NO_ANIM);
     if (s->ext && s->ext->set_playing) s->ext->set_playing(t, lua_toboolean(L, 2));
-    return slave_self(L);
+    return follower_self(L);
 }
 
-static int slave_set_matrix(lua_State *L)
+static int follower_set_matrix(lua_State *L)
 {
     Script *s;
-    void *t = slave_target(L, &s);
-    if (!t) return slave_self(L);
+    void *t = follower_target(L, &s);
+    if (!t) return follower_self(L);
     double m[6];
     for (int i = 0; i < 6; ++i) m[i] = luaL_checknumber(L, i + 2);
     check_matrix(L, m);
@@ -1761,16 +1761,16 @@ static int slave_set_matrix(lua_State *L)
     int easing = easing_from(L, 9);
     if (!s->ext || !s->ext->set_matrix || !s->ext->set_matrix(t, m, duration, easing))
         luaL_error(L, TXT_U8_BAD_MATRIX);
-    return slave_self(L);
+    return follower_self(L);
 }
 
-static int slave_set_transform(lua_State *L)
+static int follower_set_transform(lua_State *L)
 {
     const double rad = 3.14159265358979323846 / 180.0;
     Script *s;
-    void *t = slave_target(L, &s);
+    void *t = follower_target(L, &s);
     luaL_checktype(L, 2, LUA_TTABLE);
-    if (!t) return slave_self(L);
+    if (!t) return follower_self(L);
     double sx = opt_number(L, 2, "sx", -8, 8, 1), sy = opt_number(L, 2, "sy", -8, 8, 1);
     double a = opt_number(L, 2, "angle", -3600, 3600, 0) * rad;
     double tkx = tan(opt_number(L, 2, "kx", -80, 80, 0) * rad);
@@ -1807,87 +1807,87 @@ static int slave_set_transform(lua_State *L)
     check_matrix(L, m);
     if (!s->ext || !s->ext->set_matrix || !s->ext->set_matrix(t, m, duration, easing))
         luaL_error(L, TXT_U8_BAD_MATRIX);
-    return slave_self(L);
+    return follower_self(L);
 }
 
-static int slave_reset_transform(lua_State *L)
+static int follower_reset_transform(lua_State *L)
 {
     Script *s;
-    void *t = slave_target(L, &s);
-    if (!t) return slave_self(L);
+    void *t = follower_target(L, &s);
+    if (!t) return follower_self(L);
     static const double identity[6] = {1, 0, 0, 1, 0, 0};
     double d = check_duration(L, 2);
     if (s->ext && s->ext->set_matrix) s->ext->set_matrix(t, d > 0 ? identity : NULL, d, SEASE_OUT);
-    return slave_self(L);
+    return follower_self(L);
 }
 
-static int slave_set_opacity(lua_State *L)
+static int follower_set_opacity(lua_State *L)
 {
     Script *s;
-    void *t = slave_target(L, &s);
-    if (!t) return slave_self(L);
+    void *t = follower_target(L, &s);
+    if (!t) return follower_self(L);
     double a = luaL_checknumber(L, 2);
     luaL_argcheck(L, a >= 0 && a <= 1, 2, TXT_U8_BAD_RANGE);
     double d = check_duration(L, 3);
     int easing = easing_from(L, 4);
     if (s->ext && s->ext->set_opacity) s->ext->set_opacity(t, a, d, easing);
-    return slave_self(L);
+    return follower_self(L);
 }
 
-static int slave_set_cursor(lua_State *L)
+static int follower_set_cursor(lua_State *L)
 {
     Script *s;
-    void *t = slave_target(L, &s);
-    if (!t) return slave_self(L);
+    void *t = follower_target(L, &s);
+    if (!t) return follower_self(L);
     static const char *const names[] = {"move", "arrow", "hand", "none", NULL};
     int shape = luaL_checkoption(L, 2, NULL, names);
     if (s->ext && s->ext->set_cursor) s->ext->set_cursor(t, shape);
-    return slave_self(L);
+    return follower_self(L);
 }
 
-static int slave_set_draggable(lua_State *L)
+static int follower_set_draggable(lua_State *L)
 {
     Script *s;
-    void *t = slave_target(L, &s);
+    void *t = follower_target(L, &s);
     if (t && s->ext && s->ext->set_draggable) s->ext->set_draggable(t, lua_toboolean(L, 2));
-    return slave_self(L);
+    return follower_self(L);
 }
 
-static int slave_set_clickthrough(lua_State *L)
+static int follower_set_clickthrough(lua_State *L)
 {
     Script *s;
-    void *t = slave_target(L, &s);
+    void *t = follower_target(L, &s);
     if (t && s->ext && s->ext->set_clickthrough) s->ext->set_clickthrough(t, lua_toboolean(L, 2));
-    return slave_self(L);
+    return follower_self(L);
 }
 
-static int slave_tostring(lua_State *L)
+static int follower_tostring(lua_State *L)
 {
-    SlaveHandle *h = (SlaveHandle *)luaL_checkudata(L, 1, SLAVE_MT);
-    lua_pushfstring(L, "slave#%d", h->id);
+    FollowerHandle *h = (FollowerHandle *)luaL_checkudata(L, 1, FOLLOWER_MT);
+    lua_pushfstring(L, "follower#%d", h->id);
     return 1;
 }
 
-static const luaL_Reg slave_methods[] = {
-    {"pos", slave_pos}, {"size", slave_size}, {"center", slave_center}, {"hitbox", slave_hitbox},
-    {"name", slave_name}, {"id", slave_id}, {"paused", slave_paused}, {"hidden", slave_hidden},
-    {"set_pos", slave_set_pos}, {"move", slave_move}, {"set_flip", slave_set_flip},
-    {"set_hitbox", slave_set_hitbox}, {"clip", slave_clip}, {"unload", slave_unload},
-    {"play", slave_play}, {"seek", slave_seek}, {"frame", slave_frame},
-    {"clip_info", slave_clip_info}, {"set_speed", slave_set_speed},
-    {"set_playing", slave_set_playing}, {"set_paused", slave_set_paused},
-    {"set_matrix", slave_set_matrix}, {"set_transform", slave_set_transform},
-    {"reset_transform", slave_reset_transform}, {"set_opacity", slave_set_opacity},
-    {"set_cursor", slave_set_cursor}, {"set_draggable", slave_set_draggable},
-    {"set_clickthrough", slave_set_clickthrough}, {"hide", slave_hide}, {"show", slave_show},
+static const luaL_Reg follower_methods[] = {
+    {"pos", follower_pos}, {"size", follower_size}, {"center", follower_center}, {"hitbox", follower_hitbox},
+    {"name", follower_name}, {"id", follower_id}, {"paused", follower_paused}, {"hidden", follower_hidden},
+    {"set_pos", follower_set_pos}, {"move", follower_move}, {"set_flip", follower_set_flip},
+    {"set_hitbox", follower_set_hitbox}, {"clip", follower_clip}, {"unload", follower_unload},
+    {"play", follower_play}, {"seek", follower_seek}, {"frame", follower_frame},
+    {"clip_info", follower_clip_info}, {"set_speed", follower_set_speed},
+    {"set_playing", follower_set_playing}, {"set_paused", follower_set_paused},
+    {"set_matrix", follower_set_matrix}, {"set_transform", follower_set_transform},
+    {"reset_transform", follower_reset_transform}, {"set_opacity", follower_set_opacity},
+    {"set_cursor", follower_set_cursor}, {"set_draggable", follower_set_draggable},
+    {"set_clickthrough", follower_set_clickthrough}, {"hide", follower_hide}, {"show", follower_show},
     {NULL, NULL}
 };
 
-static int slave_index(lua_State *L)
+static int follower_index(lua_State *L)
 {
-    luaL_checkudata(L, 1, SLAVE_MT);
+    luaL_checkudata(L, 1, FOLLOWER_MT);
     const char *name = luaL_checkstring(L, 2);
-    for (const luaL_Reg *r = slave_methods; r->name; ++r) {
+    for (const luaL_Reg *r = follower_methods; r->name; ++r) {
         if (strcmp(r->name, name) == 0) {
             lua_pushcfunction(L, r->func);
             return 1;
@@ -1916,7 +1916,7 @@ static const luaL_Reg yagp_lib[] = {
     {"reset_transform", l_reset_transform}, {"set_opacity", l_set_opacity},
     {"set_cursor", l_set_cursor}, {"set_draggable", l_set_draggable},
     {"set_clickthrough", l_set_clickthrough}, {"notify", l_notify},
-    {"slave", l_slave}, {"slaves", l_slaves},
+    {"follower", l_follower}, {"followers", l_followers},
     {NULL, NULL}
 };
 
@@ -2304,10 +2304,10 @@ static int open_sandbox(lua_State *L)
     lua_setglobal(L, "print");
     luaL_newlib(L, log_lib);
     lua_setglobal(L, "log");
-    luaL_newmetatable(L, SLAVE_MT);
-    lua_pushcfunction(L, slave_index);
+    luaL_newmetatable(L, FOLLOWER_MT);
+    lua_pushcfunction(L, follower_index);
     lua_setfield(L, -2, "__index");
-    lua_pushcfunction(L, slave_tostring);
+    lua_pushcfunction(L, follower_tostring);
     lua_setfield(L, -2, "__tostring");
     lua_pop(L, 1);
     lua_getglobal(L, "setmetatable");
