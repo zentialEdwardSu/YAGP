@@ -1077,7 +1077,9 @@ typedef struct FakeExt {
     double matrix[6];
     bool matrix_reset;
     double matrix_dur;
-    int cursor, draggable, clickthrough;
+    int cursor, draggable, clickthrough, locked, topmost;
+    bool hidden, paused;
+    bool is_static;
     double opacity;
     char notify_title[128];
     char notify_text[1024];
@@ -1142,6 +1144,11 @@ static void x_set_opacity(void *ctx, double a, double d, int e) { (void)ctx; (vo
 static void x_set_cursor(void *ctx, int c) { (void)ctx; s_ext.cursor = c; }
 static void x_set_draggable(void *ctx, bool v) { (void)ctx; s_ext.draggable = v; }
 static void x_set_clickthrough(void *ctx, bool v) { (void)ctx; s_ext.clickthrough = v; }
+static void x_set_locked(void *ctx, bool v) { (void)ctx; s_ext.locked = v; }
+static void x_set_topmost(void *ctx, bool v) { (void)ctx; s_ext.topmost = v; }
+static bool x_is_static(void *ctx) { (void)ctx; return s_ext.is_static; }
+static void x_set_hidden(void *ctx, bool v) { (void)ctx; s_ext.hidden = v; }
+static void x_set_paused(void *ctx, bool v) { (void)ctx; s_ext.paused = v; }
 static void x_subs_changed(void *ctx, unsigned m) { (void)ctx; s_ext.subs = m; s_ext.subs_calls++; }
 static double x_now(void *ctx) { (void)ctx; return s_ext.now; }
 static bool x_notify(void *ctx, const char *title, const char *text)
@@ -1155,8 +1162,9 @@ static bool x_notify(void *ctx, const char *title, const char *text)
 
 static const ScriptHostExtOps EXT = {x_load_clip, x_unload_clip, x_clip_info, x_play, x_seek, x_get_frame,
                                      x_set_speed, x_set_playing, x_set_matrix, x_set_opacity, x_set_cursor,
-                                     x_set_draggable, x_set_clickthrough, x_subs_changed, x_now, x_notify,
-                                     NULL, NULL, NULL, NULL};
+                                     x_set_draggable, x_set_clickthrough, x_set_locked, x_set_topmost,
+                                     x_subs_changed, x_now, x_notify,
+                                     x_is_static, x_set_hidden, x_set_paused, NULL};
 
 /* A very small fake leader/follower world for the chainable handle tests. */
 static FakeWin *s_follower;
@@ -1188,8 +1196,9 @@ static const ScriptFollowerOps FOLLOWER_OPS = {follower_list, follower_resolve, 
 static const ScriptHostExtOps EXT_FOLLOWERS = {
     x_load_clip, x_unload_clip, x_clip_info, x_play, x_seek, x_get_frame,
     x_set_speed, x_set_playing, x_set_matrix, x_set_opacity, x_set_cursor,
-    x_set_draggable, x_set_clickthrough, x_subs_changed, x_now, x_notify,
-    NULL, NULL, NULL, &FOLLOWER_OPS};
+    x_set_draggable, x_set_clickthrough, x_set_locked, x_set_topmost,
+    x_subs_changed, x_now, x_notify,
+    x_is_static, x_set_hidden, x_set_paused, &FOLLOWER_OPS};
 
 static Script *load_ext_follower(FakeWin *w, const char *src, wchar_t *err)
 {
@@ -1845,6 +1854,47 @@ static void test_follower_api(void)
     s_follower = NULL;
 }
 
+static void test_own_state_api(void)
+{
+    wchar_t err[512];
+    FakeWin w = {100, 100, 40, 40, false, 0, 0};
+    w.id = 1;
+    memset(&s_ext, 0, sizeof(s_ext));
+    Script *s = load_ext(&w,
+        "assert(yagp.slave == nil and yagp.slaves == nil)\n"
+        "yagp.set_locked(true)\n"
+        "yagp.set_topmost(true)\n"
+        "yagp.hide(); yagp.show()\n"
+        "yagp.set_paused(true); yagp.set_paused(false)\n", err);
+    CHECK(s, "own state load: %ls", err);
+    if (s) {
+        CHECK(s_ext.locked == 1 && s_ext.topmost == 1, "own locked/topmost");
+        CHECK(s_ext.hidden == 0 && s_ext.paused == 0, "own hide/show and pause");
+        script_destroy(s);
+    }
+
+    s_ext.is_static = true;
+    s = load_ext(&w, "local ok, e = yagp.set_paused(true) assert(ok == nil and e)\n", err);
+    CHECK(s, "static own pause load: %ls", err);
+    if (s) script_destroy(s);
+
+    FakeWin leader = {0, 0, 50, 50, false, 0, 0};
+    FakeWin follower = {200, 200, 40, 40, false, 0, 0};
+    leader.id = 2;
+    follower.id = 9;
+    s_follower = &follower;
+    memset(&s_ext, 0, sizeof(s_ext));
+    s = load_ext_follower(&leader,
+        "local h = yagp.follower(9) assert(h)\n"
+        "assert(h:set_locked(true):set_topmost(true) == h)\n", err);
+    CHECK(s, "follower state load: %ls", err);
+    if (s) {
+        CHECK(s_ext.locked == 1 && s_ext.topmost == 1, "follower locked/topmost");
+        script_destroy(s);
+    }
+    s_follower = NULL;
+}
+
 int main(void)
 {
     /* script.c logs through rxi/log.c; capture the lines and keep stderr quiet. */
@@ -1874,6 +1924,7 @@ int main(void)
     test_lua_notify();
     test_log_no_ext();
     test_follower_api();
+    test_own_state_api();
     if (s_failures) {
         printf("%d check(s) failed\n", s_failures);
         return 1;

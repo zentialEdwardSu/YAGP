@@ -26,7 +26,7 @@ typedef struct ScriptPeer {
     bool still;             /* PNG/JPG/JPEG, no animation. */
     bool follower;        /* Follower of another overlay. */
     bool leader;            /* Has at least one follower. */
-    int leader_id;          /* 0 unless controlled. */
+    int leader_id;          /* 0 unless follower. */
     const char *name;       /* UTF-8 media file name, owned by the host. */
 } ScriptPeer;
 
@@ -133,6 +133,8 @@ typedef struct ScriptHostExtOps {
     void (*set_cursor)(void *ctx, int shape);
     void (*set_draggable)(void *ctx, bool draggable);
     void (*set_clickthrough)(void *ctx, bool clickthrough);
+    void (*set_locked)(void *ctx, bool locked);
+    void (*set_topmost)(void *ctx, bool topmost);
     /* The set of subscribed events changed (SEV_BIT mask), e.g. to start or
      * stop a mouse hook. Called from inside Lua: must not call back into the script. */
     void (*subs_changed)(void *ctx, unsigned mask);

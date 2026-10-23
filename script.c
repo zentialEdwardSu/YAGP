@@ -320,7 +320,7 @@ static int l_fits(lua_State *L)
 }
 
 /* { id, name, x, y, w, h, hx, hy, hw, hh, cx, cy, vx, vy, scripted, paused,
- *   still, controlled, leader, leader_id } */
+ *   still, follower, leader, leader_id } */
 static void push_peer(lua_State *L, const ScriptPeer *p)
 {
     lua_createtable(L, 0, 20);
@@ -1365,6 +1365,44 @@ static int l_set_clickthrough(lua_State *L)
     return 0;
 }
 
+static int l_set_locked(lua_State *L)
+{
+    Script *s = self(L);
+    if (s->ext && s->ext->set_locked) s->ext->set_locked(s->ctx, lua_toboolean(L, 1));
+    return 0;
+}
+
+static int l_set_topmost(lua_State *L)
+{
+    Script *s = self(L);
+    if (s->ext && s->ext->set_topmost) s->ext->set_topmost(s->ctx, lua_toboolean(L, 1));
+    return 0;
+}
+
+static int l_hide(lua_State *L)
+{
+    Script *s = self(L);
+    if (s->ext && s->ext->set_hidden) s->ext->set_hidden(s->ctx, true);
+    return 0;
+}
+
+static int l_show(lua_State *L)
+{
+    Script *s = self(L);
+    if (s->ext && s->ext->set_hidden) s->ext->set_hidden(s->ctx, false);
+    return 0;
+}
+
+static int l_set_paused(lua_State *L)
+{
+    Script *s = self(L);
+    if (s->ext && s->ext->is_static && s->ext->is_static(s->ctx))
+        return fail_with(L, TXT_U8_STATIC_NO_ANIM);
+    bool paused = lua_toboolean(L, 1);
+    if (s->ext && s->ext->set_paused) s->ext->set_paused(s->ctx, paused);
+    return 0;
+}
+
 /* ---- chainable follower handles ---------------------------------------------- */
 
 typedef struct FollowerHandle {
@@ -1861,6 +1899,22 @@ static int follower_set_clickthrough(lua_State *L)
     return follower_self(L);
 }
 
+static int follower_set_locked(lua_State *L)
+{
+    Script *s;
+    void *t = follower_target(L, &s);
+    if (t && s->ext && s->ext->set_locked) s->ext->set_locked(t, lua_toboolean(L, 2));
+    return follower_self(L);
+}
+
+static int follower_set_topmost(lua_State *L)
+{
+    Script *s;
+    void *t = follower_target(L, &s);
+    if (t && s->ext && s->ext->set_topmost) s->ext->set_topmost(t, lua_toboolean(L, 2));
+    return follower_self(L);
+}
+
 static int follower_tostring(lua_State *L)
 {
     FollowerHandle *h = (FollowerHandle *)luaL_checkudata(L, 1, FOLLOWER_MT);
@@ -1879,7 +1933,9 @@ static const luaL_Reg follower_methods[] = {
     {"set_matrix", follower_set_matrix}, {"set_transform", follower_set_transform},
     {"reset_transform", follower_reset_transform}, {"set_opacity", follower_set_opacity},
     {"set_cursor", follower_set_cursor}, {"set_draggable", follower_set_draggable},
-    {"set_clickthrough", follower_set_clickthrough}, {"hide", follower_hide}, {"show", follower_show},
+    {"set_clickthrough", follower_set_clickthrough},
+    {"set_locked", follower_set_locked}, {"set_topmost", follower_set_topmost},
+    {"hide", follower_hide}, {"show", follower_show},
     {NULL, NULL}
 };
 
@@ -1915,7 +1971,9 @@ static const luaL_Reg yagp_lib[] = {
     {"set_matrix", l_set_matrix}, {"set_transform", l_set_transform},
     {"reset_transform", l_reset_transform}, {"set_opacity", l_set_opacity},
     {"set_cursor", l_set_cursor}, {"set_draggable", l_set_draggable},
-    {"set_clickthrough", l_set_clickthrough}, {"notify", l_notify},
+    {"set_clickthrough", l_set_clickthrough}, {"set_locked", l_set_locked},
+    {"set_topmost", l_set_topmost}, {"hide", l_hide}, {"show", l_show},
+    {"set_paused", l_set_paused}, {"notify", l_notify},
     {"follower", l_follower}, {"followers", l_followers},
     {NULL, NULL}
 };

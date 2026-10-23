@@ -1025,7 +1025,7 @@ static void show_tray_menu(void)
         _snwprintf_s(label, ARRAYSIZE(label), _TRUNCATE, L"%s%s%s%s%s", overlay_name(o),
                      o->hidden ? TXT_TAG_HIDDEN : L"",
                      o->paused ? TXT_TAG_PAUSED : L"", moving ? TXT_TAG_MOVING : L"",
-                     o->clickthrough ? TXT_TAG_CLICKTHROUGH : L"");
+                     overlay_effective_clickthrough(o) ? TXT_TAG_CLICKTHROUGH : L"");
         AppendMenuW(menu, MF_POPUP, (UINT_PTR)sub, label);
         if (o->paused) any_paused = true; else any_playing = true;
     }

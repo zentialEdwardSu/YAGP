@@ -119,9 +119,12 @@ typedef struct Overlay {
     int op_easing;
     /* Input. */
     InputFsm input;
-    bool draggable;       /* yagp.set_draggable */
+    bool draggable;       /* yagp.set_draggable base; script overrides it. */
     int cursor_shape;     /* ScriptCursor */
     int ct_override;      /* yagp.set_clickthrough: -1 none, else 0/1; overrides clickthrough, not saved. */
+    int locked_override;  /* yagp.set_locked: -1 none, else 0/1; not saved. */
+    int topmost_override; /* yagp.set_topmost: -1 none, else 0/1; not saved. */
+    int draggable_override; /* yagp.set_draggable: -1 none, else 0/1; not saved. */
     bool tracking;        /* TrackMouseEvent armed. */
     bool sys_drag;        /* The current move loop was started by our default left drag. */
     int64_t hover_at;     /* Click-through hover check (QPC); INT64_MAX = none. */
@@ -130,6 +133,12 @@ typedef struct Overlay {
     int poll_buttons;     /* Bits 1 << button held at the last poll. */
     bool peer_dirty;      /* Moved / resized since the last peer_moved round. */
 } Overlay;
+
+bool overlay_effective_locked(const Overlay *o);
+bool overlay_effective_topmost(const Overlay *o);
+bool overlay_effective_clickthrough(const Overlay *o);
+bool overlay_effective_draggable(const Overlay *o);
+bool overlay_effective_drag_locked(const Overlay *o);
 
 void overlay_cache_ready(void *job);
 

@@ -81,9 +81,29 @@ const wchar_t *overlay_name(const Overlay *o)
     return slash ? slash + 1 : o->path;
 }
 
-static bool effective_clickthrough(const Overlay *o)
+bool overlay_effective_clickthrough(const Overlay *o)
 {
     return o->ct_override >= 0 ? o->ct_override != 0 : o->clickthrough;
+}
+
+bool overlay_effective_locked(const Overlay *o)
+{
+    return o->locked_override >= 0 ? o->locked_override != 0 : o->locked;
+}
+
+bool overlay_effective_topmost(const Overlay *o)
+{
+    return o->topmost_override >= 0 ? o->topmost_override != 0 : o->topmost;
+}
+
+bool overlay_effective_draggable(const Overlay *o)
+{
+    return o->draggable_override >= 0 ? o->draggable_override != 0 : o->draggable;
+}
+
+bool overlay_effective_drag_locked(const Overlay *o)
+{
+    return overlay_effective_locked(o) || !overlay_effective_draggable(o);
 }
 
 static bool overlay_effective_hidden(const Overlay *o)
@@ -120,15 +140,29 @@ static void apply_ex_style(Overlay *o)
 {
     LONG_PTR ex = GetWindowLongPtrW(o->hwnd, GWL_EXSTYLE);
     ex &= ~(LONG_PTR)(WS_EX_LAYERED | WS_EX_TRANSPARENT);
-    bool ct = effective_clickthrough(o);
+    bool ct = overlay_effective_clickthrough(o);
     /* Cross-process click-through needs both bits; LWA_ALPHA=255 leaves the
      * DirectComposition content untouched. */
     if (ct) ex |= WS_EX_LAYERED | WS_EX_TRANSPARENT;
     SetWindowLongPtrW(o->hwnd, GWL_EXSTYLE, ex);
     if (ct) SetLayeredWindowAttributes(o->hwnd, 0, 255, LWA_ALPHA);
-    SetWindowPos(o->hwnd, o->topmost ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0,
+    SetWindowPos(o->hwnd, overlay_effective_topmost(o) ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     ifsm_reset(&o->input); /* Input now arrives by the other route. */
+}
+
+static void clear_runtime_overrides(Overlay *o)
+{
+    bool had_top = overlay_effective_topmost(o);
+    bool had_lock = overlay_effective_drag_locked(o);
+    bool had_ct = overlay_effective_clickthrough(o);
+    o->ct_override = -1;
+    o->locked_override = -1;
+    o->topmost_override = -1;
+    o->draggable_override = -1;
+    if (had_top != overlay_effective_topmost(o) || had_ct != overlay_effective_clickthrough(o))
+        apply_ex_style(o);
+    if (had_lock != overlay_effective_drag_locked(o)) overlay_refresh_hook();
 }
 
 /* ---- geometry ---------------------------------------------------------------
@@ -988,7 +1022,32 @@ static void xhost_set_cursor(void *ctx, int shape)
 
 static void xhost_set_draggable(void *ctx, bool draggable)
 {
-    ((Overlay *)ctx)->draggable = draggable;
+    Overlay *o = (Overlay *)ctx;
+    int want = draggable ? 1 : 0;
+    if (o->draggable_override == want) return;
+    bool before = overlay_effective_drag_locked(o);
+    o->draggable_override = want;
+    if (overlay_effective_drag_locked(o) != before) overlay_refresh_hook();
+}
+
+static void xhost_set_locked(void *ctx, bool locked)
+{
+    Overlay *o = (Overlay *)ctx;
+    int want = locked ? 1 : 0;
+    if (o->locked_override == want) return;
+    bool before = overlay_effective_drag_locked(o);
+    o->locked_override = want;
+    if (overlay_effective_drag_locked(o) != before) overlay_refresh_hook();
+}
+
+static void xhost_set_topmost(void *ctx, bool topmost)
+{
+    Overlay *o = (Overlay *)ctx;
+    int want = topmost ? 1 : 0;
+    if (o->topmost_override == want) return;
+    bool before = overlay_effective_topmost(o);
+    o->topmost_override = want;
+    if (overlay_effective_topmost(o) != before) apply_ex_style(o);
 }
 
 static void xhost_set_clickthrough(void *ctx, bool ct)
@@ -996,9 +1055,9 @@ static void xhost_set_clickthrough(void *ctx, bool ct)
     Overlay *o = (Overlay *)ctx;
     int want = ct ? 1 : 0;
     if (o->ct_override == want) return;
-    bool before = effective_clickthrough(o);
+    bool before = overlay_effective_clickthrough(o);
     o->ct_override = want;
-    if (effective_clickthrough(o) != before) {
+    if (overlay_effective_clickthrough(o) != before) {
         apply_ex_style(o);
         overlay_refresh_hook();
     }
@@ -1053,7 +1112,8 @@ static void xhost_set_paused(void *ctx, bool paused)
 static const ScriptHostExtOps HOST_EXT = {
     xhost_load_clip, xhost_unload_clip, xhost_clip_info, xhost_play, xhost_seek, xhost_get_frame,
     xhost_set_speed, xhost_set_playing, xhost_set_matrix, xhost_set_opacity, xhost_set_cursor,
-    xhost_set_draggable, xhost_set_clickthrough, xhost_subs_changed, xhost_now, xhost_notify,
+    xhost_set_draggable, xhost_set_clickthrough, xhost_set_locked, xhost_set_topmost,
+    xhost_subs_changed, xhost_now, xhost_notify,
     xhost_is_static, xhost_set_hidden, xhost_set_paused, &FOLLOWER_OPS,
 };
 
@@ -1110,10 +1170,7 @@ static void reset_script_state(Overlay *o)
     }
     o->draggable = true;
     o->cursor_shape = SCURSOR_MOVE;
-    if (o->ct_override >= 0) {
-        o->ct_override = -1;
-        apply_ex_style(o);
-    }
+    clear_runtime_overrides(o);
     o->has_override = false;
     if (o->flip_x) host_set_flip(o, false);
     o->next_timer = INT64_MAX;
@@ -1122,6 +1179,7 @@ static void reset_script_state(Overlay *o)
 /* Stops the script (window stays where it is) and tells the user why. */
 static void script_fail(Overlay *o, const wchar_t *err)
 {
+    clear_runtime_overrides(o);
     script_destroy(o->script);
     o->script = NULL;
     o->subs = 0;
@@ -1280,6 +1338,7 @@ bool overlay_bind_leader(Overlay *follower, Overlay *leader, wchar_t *err, size_
             return false;
         }
     }
+    clear_runtime_overrides(follower);
     script_destroy(follower->script);
     follower->script = NULL;
     follower->subs = 0;
@@ -1290,7 +1349,7 @@ bool overlay_bind_leader(Overlay *follower, Overlay *leader, wchar_t *err, size_
     overlay_refresh_hook();
     app_changed();
     char u8[MAX_PATH * 4];
-    log_info("GIF #%d is now controlled by #%d (%s)", follower->id, leader->id,
+    log_info("GIF #%d now follows leader #%d (%s)", follower->id, leader->id,
              applog_u8(overlay_name(leader), u8, sizeof(u8)));
     return true;
 }
@@ -1533,7 +1592,7 @@ void overlay_update_contacts(void)
     for (Overlay *o = g_app.overlays; o; o = o->next) {
         if (!o->peer_dirty) continue;
         o->peer_dirty = false;
-        if (effective_clickthrough(o) && (o->subs & SEV_INPUT_MASK)) watch_moved = true;
+        if (overlay_effective_clickthrough(o) && (o->subs & SEV_INPUT_MASK)) watch_moved = true;
         if (!any_sub || overlay_effective_hidden(o)) continue;
         ScriptPeer p;
         fill_peer(o, &p);
@@ -1630,7 +1689,7 @@ static bool route(Overlay *o, const InputOut *out, int x, int y, bool passthroug
         if (ev == IFSM_DRAG_START && handled) ifsm_take_drag(&o->input);
         int act = ifsm_default_action(&o->input, out, i, handled);
         if (act == IFSM_ACT_SYSTEM_DRAG) {
-            if (o->locked || !o->draggable) continue;
+            if (overlay_effective_drag_locked(o)) continue;
             /* Hand the press over to the system move loop (WM_ENTERSIZEMOVE ...). */
             ifsm_cancel(&o->input);
             ReleaseCapture();
@@ -1748,7 +1807,7 @@ static bool window_input(Overlay *o, UINT msg, WPARAM wp, LPARAM lp)
 
 static bool wants_hook_input(const Overlay *o)
 {
-    return script_live(o) && effective_clickthrough(o) && (o->subs & SEV_INPUT_MASK) && o->surface;
+    return script_live(o) && overlay_effective_clickthrough(o) && (o->subs & SEV_INPUT_MASK) && o->surface;
 }
 
 static bool wants_cursor(const Overlay *o)
@@ -1790,7 +1849,7 @@ void overlay_refresh_hook(void)
         } else if (!poll) {
             o->next_poll = INT64_MAX;
         }
-        if (!wants_hook_input(o) && effective_clickthrough(o)) o->hover_at = INT64_MAX;
+        if (!wants_hook_input(o) && overlay_effective_clickthrough(o)) o->hover_at = INT64_MAX;
     }
     app_reschedule();
 }
@@ -1812,7 +1871,7 @@ void overlay_cursor_moved(void)
  * Walks up the z-order from the topmost window there to o. */
 static bool on_top_at(const Overlay *o, int x, int y)
 {
-    if (o->topmost) {
+    if (overlay_effective_topmost(o)) {
         /* Only another topmost window above it can cover it. */
         POINT p = {x, y};
         HWND top = WindowFromPoint(p);
@@ -1934,7 +1993,7 @@ static HCURSOR cursor_for(const Overlay *o)
 {
     if (o->cursor_shape == SCURSOR_NONE) return NULL;
     if (o->cursor_shape == SCURSOR_HAND) return LoadCursorW(NULL, IDC_HAND);
-    if (o->cursor_shape == SCURSOR_ARROW || o->locked || !o->draggable) return LoadCursorW(NULL, IDC_ARROW);
+    if (o->cursor_shape == SCURSOR_ARROW || overlay_effective_drag_locked(o)) return LoadCursorW(NULL, IDC_ARROW);
     return LoadCursorW(NULL, IDC_SIZEALL);
 }
 
@@ -2047,6 +2106,9 @@ static void init_defaults(Overlay *o)
     o->opacity = o->op_from = o->op_to = 1.0;
     o->draggable = true;
     o->ct_override = -1;
+    o->locked_override = -1;
+    o->topmost_override = -1;
+    o->draggable_override = -1;
     o->next_timer = INT64_MAX;
     o->hover_at = INT64_MAX;
     o->next_poll = INT64_MAX;
@@ -2086,7 +2148,7 @@ Overlay *overlay_create(const OverlayConfig *cfg, bool use_position, int cascade
     /* WS_EX_TOOLWINDOW without an owner keeps it off the taskbar and Alt+Tab.
      * WS_EX_NOREDIRECTIONBITMAP: DWM composes only our DirectComposition visual. */
     DWORD ex = WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP | WS_EX_NOACTIVATE;
-    if (o->topmost) ex |= WS_EX_TOPMOST;
+    if (overlay_effective_topmost(o)) ex |= WS_EX_TOPMOST;
     SIZE s = scaled_size(o);
     o->aabb[2] = s.cx;
     o->aabb[3] = s.cy;
@@ -2099,7 +2161,7 @@ Overlay *overlay_create(const OverlayConfig *cfg, bool use_position, int cascade
 
     RECT r = {cfg->x, cfg->y, cfg->x + s.cx, cfg->y + s.cy};
     if (!use_position || !MonitorFromRect(&r, MONITOR_DEFAULTTONULL)) center_on_primary(o, cascade);
-    if (o->clickthrough) apply_ex_style(o);
+    if (overlay_effective_clickthrough(o)) apply_ex_style(o);
     stage = "cannot create the swap chain";
     if (!overlay_attach_surface(o)) goto fail;
     reset_timing(o);
@@ -2315,15 +2377,23 @@ void overlay_command(Overlay *o, UINT cmd)
     case OVERLAY_CMD_REPLACE:
         app_pick_files(PICK_REPLACE, o);
         break;
-    case OVERLAY_CMD_TOPMOST:
-        o->topmost = !o->topmost;
+    case OVERLAY_CMD_TOPMOST: {
+        bool next = !overlay_effective_topmost(o);
+        o->topmost = next;
+        o->topmost_override = -1;
         apply_ex_style(o);
         break;
-    case OVERLAY_CMD_LOCK:
-        o->locked = !o->locked;
+    }
+    case OVERLAY_CMD_LOCK: {
+        bool next = !overlay_effective_drag_locked(o);
+        o->locked = next;
+        o->locked_override = -1;
+        o->draggable_override = -1;
+        overlay_refresh_hook();
         break;
+    }
     case OVERLAY_CMD_CLICKTHROUGH:
-        o->clickthrough = !o->clickthrough;
+        o->clickthrough = !overlay_effective_clickthrough(o);
         o->ct_override = -1; /* The user's choice wins over a script's. */
         apply_ex_style(o);
         overlay_refresh_hook();
@@ -2530,11 +2600,11 @@ void overlay_build_menu(const Overlay *o, HMENU menu, UINT base)
         bool on = o->script_spec && *o->script_spec;
         AppendMenuW(menu, MF_POPUP | (on ? MF_CHECKED : 0), (UINT_PTR)motion, TXT_MENU_SCRIPT);
     }
-    chk = o->topmost ? MF_CHECKED : 0;
+    chk = overlay_effective_topmost(o) ? MF_CHECKED : 0;
     AppendMenuW(menu, MF_STRING | chk, base + OVERLAY_CMD_TOPMOST, TXT_MENU_TOPMOST);
-    chk = o->locked ? MF_CHECKED : 0;
+    chk = overlay_effective_drag_locked(o) ? MF_CHECKED : 0;
     AppendMenuW(menu, MF_STRING | chk, base + OVERLAY_CMD_LOCK, TXT_MENU_LOCK);
-    chk = o->clickthrough ? MF_CHECKED : 0;
+    chk = overlay_effective_clickthrough(o) ? MF_CHECKED : 0;
     AppendMenuW(menu, MF_STRING | chk, base + OVERLAY_CMD_CLICKTHROUGH, TXT_MENU_CLICKTHROUGH);
     AppendMenuW(menu, MF_STRING, base + OVERLAY_CMD_RECENTER, TXT_MENU_RECENTER);
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
