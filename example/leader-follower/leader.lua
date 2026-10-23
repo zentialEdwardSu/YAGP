@@ -5,7 +5,11 @@ local t = 0
 local last_notify = 0
 local last_log = 0
 
-yagp.notify("YAGP demo", "Leader demo: right-click the follower and choose Belongs to…")
+function on_moved()
+  home_x, home_y = yagp.pos()
+end
+
+yagp.notify("YAGP demo", "Leader demo: right-click the follower and choose Leader…")
 
 local function clamp(x, y, w, h)
   local work = yagp.monitor().work
@@ -28,7 +32,7 @@ function update(dt)
   if #followers == 0 then
     if t - last_notify > 6 then
       last_notify = t
-      yagp.notify("YAGP demo", "Leader: bind the follower via Belongs to…")
+      yagp.notify("YAGP demo", "Leader: bind the follower via Leader…")
     end
     return
   end

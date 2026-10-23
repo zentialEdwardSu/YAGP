@@ -1,10 +1,14 @@
 -- Follower demo: this output stops while the GIF is bound to a leader, and appears
 -- again after the relation is removed.
 log.info("FOLLOWER SCRIPT RAN")
-yagp.notify("YAGP demo", "Follower script is running; bind it via Belongs to…")
+yagp.notify("YAGP demo", "Follower script is running; bind it via Leader…")
 
 local x0, y0 = yagp.pos()
 local t = 0
+
+function on_moved()
+  x0, y0 = yagp.pos()
+end
 
 function update(dt)
   t = t + dt

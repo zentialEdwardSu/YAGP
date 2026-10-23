@@ -3,6 +3,10 @@ local x0, y0 = yagp.pos()
 local t = 0
 local last_notify = 0
 
+function on_moved()
+  x0, y0 = yagp.pos()
+end
+
 local ok, err = yagp.play("main")
 log.info("PNG static demo: play ->", tostring(ok), tostring(err))
 local dx, dy, hw, hh = yagp.hitbox()

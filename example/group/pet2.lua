@@ -2,6 +2,10 @@ log.info("GROUP MEMBER pet2.png")
 local x0, y0 = yagp.pos()
 local t = 0
 
+function on_moved()
+  x0, y0 = yagp.pos()
+end
+
 function update(dt)
   t = t + dt
   local work = yagp.monitor().work

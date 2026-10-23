@@ -3,6 +3,10 @@ local x0, y0 = yagp.pos()
 local t = 0
 local last_notify = 0
 
+function on_moved()
+  x0, y0 = yagp.pos()
+end
+
 local ok, err = yagp.clip("thumb", "file.png")
 log.info("JPEG static demo: clip ->", tostring(ok), tostring(err))
 yagp.notify("YAGP demo", "JPEG static image: no alpha, no animation controls")
