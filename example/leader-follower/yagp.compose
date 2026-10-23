@@ -1,0 +1,11 @@
+version: 1
+name: leader-follower
+members:
+  - media: leader.gif
+    script: leader.lua
+    position: [220, 220]
+    topmost: true
+  - media: follower.gif
+    script: follower.lua
+    position: [620, 300]
+    leader: leader.gif

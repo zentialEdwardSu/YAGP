@@ -1,0 +1,9 @@
+version: 1
+name: group
+members:
+  - media: pet1.gif
+    script: pet1.lua
+    position: [280, 280]
+  - media: pet2.png
+    script: pet2.lua
+    position: [700, 320]

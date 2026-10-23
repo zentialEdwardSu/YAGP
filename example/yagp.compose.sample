@@ -1,0 +1,52 @@
+# YAGP compose 填写样例
+#
+# 使用方法：
+#   1. 把这个文件复制到你的分组目录；
+#   2. 重命名为 yagp.compose（或任意以 .compose 结尾的名字）；
+#   3. 按实际文件名修改下面的 media / script；
+#   4. 托盘 →“分组”→“导入分组…”，选择该 .compose 文件。
+#
+# 注意：
+#   - 本文件以 .sample 结尾，故意不会出现在导入文件选择器中。
+#   - media / script 必须是相对于本文件所在目录的路径，不能写绝对路径或 ..。
+#   - 未在 members 里列出的文件不会被导入，可用于存放不会成为宠物的素材。
+#   - 一个成员最多有一个 leader；一个 leader 可以有多个 follower。
+#   - 只允许一层关系：有 leader 的成员不能再拥有 follower。
+#   - follower 的脚本不会运行，但脚本绑定会保留，解除关系后恢复。
+
+version: 1
+
+# 可选。省略时使用 compose 文件所在文件夹的名字。
+name: my-pet-group
+
+members:
+  # ---- leader：不写 leader 字段的成员就是独立成员或 leader ----
+  - media: leader.gif          # 必需：GIF/PNG/JPG，相对本文件所在目录
+    script: leader.lua         # 可选：相对本文件所在目录的 .lua
+    position: [200, 200]       # 可选：[x, y]；省略则由 YAGP 自动摆放
+    scale: 100                 # 可选：5..250，默认 100
+    paused: false              # 可选：仅 GIF 支持；静态图不能为 true
+    hidden: false               # 可选：导入后是否隐藏
+    topmost: false              # 可选：是否置顶
+    locked: false               # 可选：是否锁定位置
+    clickthrough: false         # 可选：是否点击穿透
+
+    # 可选：颜色键
+    key:
+      enabled: false
+      color: '#00FF00'          # #RRGGBB
+      tolerance: 16             # 0..255
+
+  # ---- follower：用 leader 指向另一个成员的 media ----
+  - media: follower.png
+    script: follower.lua
+    position: [620, 300]
+    leader: leader.gif          # 自动绑定到上面的 leader.gif
+
+  # ---- 独立成员示例：没有 leader 字段 ----
+  - media: solo.gif
+    script: solo.lua
+    position: [360, 420]
+
+# 如果不需要 leader/follower，删除所有 leader: 行即可；
+# 每个成员都会独立运行自己的脚本。

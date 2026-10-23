@@ -43,6 +43,7 @@ enum {
     TRAY_CMD_LOG,
     TRAY_CMD_EXIT,
     TRAY_CMD_GROUP_IMPORT = 20,
+    TRAY_CMD_GROUP_CREATE,
     TRAY_CMD_OVERLAY_BASE = 1000,
     TRAY_CMD_GROUP_BASE = 1000000,   /* + group index * 4 + action */
     TRAY_CMD_LEADER_BASE = 2000000   /* + leader overlay id */
@@ -374,6 +375,7 @@ static const wchar_t *pick_verb(PickKind kind)
     case PICK_NEW_SCRIPT: return L"newscript";
     case PICK_LOG_DIR: return L"logdir";
     case PICK_GROUP: return L"group";
+    case PICK_GROUP_CREATE: return L"groupcreate";
     default: return L"add";
     }
 }
@@ -464,6 +466,11 @@ static void app_pick_group(void)
     launch_picker(PICK_GROUP, NULL, NULL);
 }
 
+static void app_pick_group_create(void)
+{
+    launch_picker(PICK_GROUP_CREATE, NULL, NULL);
+}
+
 /* Payload: uint64 id, then NUL separated full paths, double-NUL terminated. */
 static void handle_pick_result(const COPYDATASTRUCT *cds)
 {
@@ -495,15 +502,29 @@ static void handle_pick_result(const COPYDATASTRUCT *cds)
     }
     if (g_app.pick_kind == PICK_GROUP) {
         if (!*p) {
-            log_debug("picker returned no group folder");
+            log_debug("picker returned no compose file");
             return;
         }
         wchar_t err[512];
-        if (!group_import_folder(p, err, ARRAYSIZE(err))) {
+        if (!group_import_compose(p, err, ARRAYSIZE(err))) {
             log_warn("group import failed: %ls", err);
             app_notify(TXT_GROUP_IMPORT_TITLE, err);
         } else {
             app_notify(TXT_GROUP_IMPORT_TITLE, TXT_GROUP_IMPORT_DONE);
+        }
+        return;
+    }
+    if (g_app.pick_kind == PICK_GROUP_CREATE) {
+        if (!*p) {
+            log_debug("picker returned no compose template path");
+            return;
+        }
+        wchar_t err[512];
+        if (!group_create_template(p, err, ARRAYSIZE(err))) {
+            log_warn("compose template creation failed: %ls", err);
+            app_notify(TXT_GROUP_IMPORT_TITLE, err);
+        } else {
+            app_notify(TXT_GROUP_IMPORT_TITLE, TXT_GROUP_TEMPLATE_DONE);
         }
         return;
     }
@@ -620,26 +641,40 @@ static int run_pick_group(int argc, wchar_t **argv, uint64_t id)
 {
     (void)argc;
     (void)argv;
-    wchar_t initial[MAX_PATH * 2] = L"";
-    PWSTR docs = NULL;
-    if (SUCCEEDED(SHGetKnownFolderPath(&FOLDERID_Documents, 0, NULL, &docs))) {
-        wcsncpy_s(initial, ARRAYSIZE(initial), docs, _TRUNCATE);
-        CoTaskMemFree(docs);
-    }
-    BROWSEINFOW bi;
-    memset(&bi, 0, sizeof(bi));
-    wchar_t display[MAX_PATH] = L"";
-    bi.pszDisplayName = display;
-    bi.lpszTitle = TXT_TITLE_PICK_GROUP;
-    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_USENEWUI;
-    bi.lpfn = browse_init;
-    bi.lParam = (LPARAM)(initial[0] ? initial : NULL);
-    PIDLIST_ABSOLUTE pidl = SHBrowseForFolderW(&bi);
-    if (!pidl) return 0;
-    wchar_t path[MAX_PATH * 2];
-    bool ok = SHGetPathFromIDListW(pidl, path) != FALSE;
-    CoTaskMemFree(pidl);
-    if (!ok) return 1;
+    wchar_t path[MAX_PATH * 2] = L"";
+    OPENFILENAMEW ofn;
+    memset(&ofn, 0, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.lpstrFilter = TXT_FILTER_COMPOSE;
+    ofn.lpstrFile = path;
+    ofn.nMaxFile = ARRAYSIZE(path);
+    ofn.lpstrTitle = TXT_TITLE_PICK_GROUP;
+    ofn.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
+    if (!GetOpenFileNameW(&ofn)) return 0;
+    size_t used = wcslen(path) + 2;
+    wchar_t *out = (wchar_t *)calloc(used, sizeof(wchar_t));
+    if (!out) return 1;
+    memcpy(out, path, (used - 2) * sizeof(wchar_t));
+    send_pick_result(id, out, used);
+    free(out);
+    return 0;
+}
+
+static int run_pick_group_create(int argc, wchar_t **argv, uint64_t id)
+{
+    (void)argc;
+    (void)argv;
+    wchar_t path[MAX_PATH * 2] = L"yagp.compose";
+    OPENFILENAMEW ofn;
+    memset(&ofn, 0, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.lpstrFilter = TXT_FILTER_COMPOSE;
+    ofn.lpstrDefExt = L"compose";
+    ofn.lpstrFile = path;
+    ofn.nMaxFile = ARRAYSIZE(path);
+    ofn.lpstrTitle = TXT_TITLE_CREATE_GROUP;
+    ofn.Flags = OFN_EXPLORER | OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT | OFN_HIDEREADONLY;
+    if (!GetSaveFileNameW(&ofn)) return 0;
     size_t used = wcslen(path) + 2;
     wchar_t *out = (wchar_t *)calloc(used, sizeof(wchar_t));
     if (!out) return 1;
@@ -698,6 +733,12 @@ static int run_picker(int argc, wchar_t **argv)
     if (argc >= 4 && wcscmp(argv[2], L"group") == 0) {
         HRESULT com = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
         int rc = run_pick_group(argc, argv, wcstoull(argv[3], NULL, 16));
+        if (SUCCEEDED(com)) CoUninitialize();
+        return rc;
+    }
+    if (argc >= 4 && wcscmp(argv[2], L"groupcreate") == 0) {
+        HRESULT com = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        int rc = run_pick_group_create(argc, argv, wcstoull(argv[3], NULL, 16));
         if (SUCCEEDED(com)) CoUninitialize();
         return rc;
     }
@@ -957,6 +998,7 @@ static void show_tray_menu(void)
     HMENU groups = CreatePopupMenu();
     if (groups) {
         AppendMenuW(groups, MF_STRING, TRAY_CMD_GROUP_IMPORT, TXT_MENU_GROUP_IMPORT);
+        AppendMenuW(groups, MF_STRING, TRAY_CMD_GROUP_CREATE, TXT_MENU_GROUP_CREATE);
         if (g_app.groups) AppendMenuW(groups, MF_SEPARATOR, 0, NULL);
         UINT gi = 0;
         for (Group *g = g_app.groups; g; g = g->next, ++gi) {
@@ -1038,6 +1080,9 @@ static void show_tray_menu(void)
         break;
     case TRAY_CMD_GROUP_IMPORT:
         app_pick_group();
+        break;
+    case TRAY_CMD_GROUP_CREATE:
+        app_pick_group_create();
         break;
     case TRAY_CMD_PAUSE_ALL:
     case TRAY_CMD_RESUME_ALL:

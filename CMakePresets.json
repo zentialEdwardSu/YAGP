@@ -22,13 +22,13 @@
       "name": "release",
       "configurePreset": "release",
       "configuration": "Release",
-      "targets": ["yagp", "script_test", "gif_dump", "log_test", "image_dump", "group_test", "config_test"]
+      "targets": ["yagp", "script_test", "gif_dump", "log_test", "image_dump", "group_test", "compose_test", "config_test"]
     },
     {
       "name": "release-en",
       "configurePreset": "release-en",
       "configuration": "Release",
-      "targets": ["yagp", "script_test", "gif_dump", "log_test", "image_dump", "group_test", "config_test"]
+      "targets": ["yagp", "script_test", "gif_dump", "log_test", "image_dump", "group_test", "compose_test", "config_test"]
     }
   ],
   "workflowPresets": [

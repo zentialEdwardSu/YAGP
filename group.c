@@ -8,6 +8,7 @@
 
 #include "app.h"
 #include "applog.h"
+#include "compose.h"
 #include "config.h"
 #include "i18n.h"
 #include "log.h"
@@ -145,137 +146,6 @@ void group_remove(Group *g)
     app_changed();
 }
 
-static bool media_ext(const wchar_t *name, const wchar_t **ext)
-{
-    const wchar_t *dot = wcsrchr(name, L'.');
-    if (!dot) return false;
-    if (_wcsicmp(dot, L".gif") == 0 || _wcsicmp(dot, L".png") == 0 ||
-        _wcsicmp(dot, L".jpg") == 0 || _wcsicmp(dot, L".jpeg") == 0) {
-        *ext = dot;
-        return true;
-    }
-    return false;
-}
-
-static void make_script_path(const wchar_t *media, const wchar_t *dir, wchar_t *out, size_t cap)
-{
-    const wchar_t *base = wcsrchr(media, L'\\');
-    base = base ? base + 1 : media;
-    const wchar_t *dot = wcsrchr(base, L'.');
-    size_t stem = dot && dot > base ? (size_t)(dot - base) : wcslen(base);
-    _snwprintf_s(out, cap, _TRUNCATE, L"%s\\%.*s.lua", dir, (int)stem, base);
-}
-
-static bool scan_add(GroupScan *scan, const wchar_t *media, const wchar_t *script)
-{
-    if (scan->count >= GROUP_MAX_MEMBERS) return false;
-    GroupMember *items = (GroupMember *)realloc(scan->items, (size_t)(scan->count + 1) * sizeof(*items));
-    if (!items) return false;
-    scan->items = items;
-    wchar_t *m = dup_wcs(media), *s = dup_wcs(script);
-    if (!m || !s) {
-        free(m);
-        free(s);
-        return false;
-    }
-    scan->items[scan->count].media = m;
-    scan->items[scan->count].script = s;
-    ++scan->count;
-    return true;
-}
-
-static int member_cmp(const void *a, const void *b)
-{
-    const GroupMember *ma = (const GroupMember *)a;
-    const GroupMember *mb = (const GroupMember *)b;
-    return _wcsicmp(ma->media, mb->media);
-}
-
-static bool scan_dir(GroupScan *scan, const wchar_t *dir, int depth, wchar_t *err, size_t cap)
-{
-    if (depth > GROUP_MAX_DEPTH) {
-        _snwprintf_s(err, cap, _TRUNCATE, TXT_GROUP_ERR_DEEP);
-        return false;
-    }
-    wchar_t pattern[GROUP_PATH_MAX];
-    if (_snwprintf_s(pattern, ARRAYSIZE(pattern), _TRUNCATE, L"%s\\*", dir) <= 0) {
-        _snwprintf_s(err, cap, _TRUNCATE, TXT_GROUP_ERR_PATH);
-        return false;
-    }
-    WIN32_FIND_DATAW fd;
-    HANDLE h = FindFirstFileW(pattern, &fd);
-    if (h == INVALID_HANDLE_VALUE) {
-        _snwprintf_s(err, cap, _TRUNCATE, TXT_GROUP_ERR_SCAN);
-        return false;
-    }
-    bool ok = true;
-    do {
-        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
-        wchar_t path[GROUP_PATH_MAX];
-        if (_snwprintf_s(path, ARRAYSIZE(path), _TRUNCATE, L"%s\\%s", dir, fd.cFileName) <= 0) {
-            _snwprintf_s(err, cap, _TRUNCATE, TXT_GROUP_ERR_PATH);
-            ok = false;
-            break;
-        }
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
-            if (!scan_dir(scan, path, depth + 1, err, cap)) {
-                ok = false;
-                break;
-            }
-            continue;
-        }
-        const wchar_t *ext = NULL;
-        if (!media_ext(fd.cFileName, &ext)) continue;
-        wchar_t script[GROUP_PATH_MAX];
-        make_script_path(fd.cFileName, dir, script, ARRAYSIZE(script));
-        DWORD attr = GetFileAttributesW(script);
-        if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY)) continue;
-        if (!scan_add(scan, path, script)) {
-            _snwprintf_s(err, cap, _TRUNCATE, TXT_GROUP_ERR_MANY);
-            ok = false;
-            break;
-        }
-    } while (FindNextFileW(h, &fd));
-    FindClose(h);
-    return ok;
-}
-
-bool group_scan_folder(const wchar_t *folder, GroupScan *out, wchar_t *err, size_t cap)
-{
-    memset(out, 0, sizeof(*out));
-    if (err && cap) err[0] = 0;
-    if (!folder || !*folder) {
-        if (err) _snwprintf_s(err, cap, _TRUNCATE, TXT_GROUP_ERR_NO_FOLDER);
-        return false;
-    }
-    wchar_t dir[GROUP_PATH_MAX];
-    wcsncpy_s(dir, ARRAYSIZE(dir), folder, _TRUNCATE);
-    make_absolute_folder(dir, ARRAYSIZE(dir));
-    if (!scan_dir(out, dir, 0, err, cap)) {
-        group_scan_free(out);
-        return false;
-    }
-    if (out->count == 0) {
-        if (err) _snwprintf_s(err, cap, _TRUNCATE, TXT_GROUP_ERR_NO_PAIR);
-        group_scan_free(out);
-        return false;
-    }
-    qsort(out->items, (size_t)out->count, sizeof(*out->items), member_cmp);
-    return true;
-}
-
-void group_scan_free(GroupScan *s)
-{
-    if (!s) return;
-    for (int i = 0; i < s->count; ++i) {
-        free(s->items[i].media);
-        free(s->items[i].script);
-    }
-    free(s->items);
-    memset(s, 0, sizeof(*s));
-}
-
 static void unique_group_name(const wchar_t *base, wchar_t *out, size_t cap)
 {
     wcsncpy_s(out, cap, base, _TRUNCATE);
@@ -303,53 +173,186 @@ static void leaf_name(const wchar_t *folder, wchar_t *out, size_t cap)
     wcsncpy_s(out, cap, p, _TRUNCATE);
 }
 
-bool group_import_folder(const wchar_t *folder, wchar_t *err, size_t cap)
+static void rollback_group(Group *g)
+{
+    Overlay **p = &g_app.overlays;
+    while (*p) {
+        Overlay *o = *p;
+        if (o->group == g) {
+            *p = o->next;
+            overlay_destroy(o);
+        } else {
+            p = &o->next;
+        }
+    }
+    group_destroy(g);
+}
+
+bool group_import_compose(const wchar_t *compose_path, wchar_t *err, size_t cap)
 {
     if (err && cap) err[0] = 0;
-    if (group_find_folder(folder)) {
+    const wchar_t *file_base = wcsrchr(compose_path, L'\\');
+    file_base = file_base ? file_base + 1 : compose_path;
+    const wchar_t *ext = wcsrchr(file_base, L'.');
+    if (!ext || _wcsicmp(ext, L".compose") != 0) {
+        if (err) _snwprintf_s(err, cap, _TRUNCATE, TXT_GROUP_ERR_COMPOSE);
+        return false;
+    }
+
+    ComposeDoc doc;
+    if (!compose_parse_file(compose_path, &doc, err, cap)) return false;
+
+    wchar_t root[GROUP_PATH_MAX];
+    wcsncpy_s(root, ARRAYSIZE(root), doc.root, _TRUNCATE);
+    normalize_folder(root);
+    if (group_find_folder(root)) {
         if (err) _snwprintf_s(err, cap, _TRUNCATE, TXT_GROUP_ERR_EXISTS);
+        compose_free(&doc);
         return false;
     }
-    GroupScan scan;
-    if (!group_scan_folder(folder, &scan, err, cap)) return false;
 
-    wchar_t name[128], unique[160];
-    leaf_name(folder, name, ARRAYSIZE(name));
-    unique_group_name(name, unique, ARRAYSIZE(unique));
-    Group *g = group_create(unique, folder);
+    wchar_t base[128], unique[160];
+    if (doc.name && *doc.name) wcsncpy_s(base, ARRAYSIZE(base), doc.name, _TRUNCATE);
+    else leaf_name(root, base, ARRAYSIZE(base));
+    unique_group_name(base, unique, ARRAYSIZE(unique));
+    Group *g = group_create(unique, root);
     if (!g) {
-        group_scan_free(&scan);
         if (err) _snwprintf_s(err, cap, _TRUNCATE, TXT_GROUP_ERR_CREATE);
+        compose_free(&doc);
         return false;
     }
 
-    int created = 0;
-    for (int i = 0; i < scan.count; ++i) {
+    Overlay **created = (Overlay **)calloc((size_t)doc.count, sizeof(*created));
+    if (!created) {
+        if (err) _snwprintf_s(err, cap, _TRUNCATE, TXT_GROUP_ERR_CREATE);
+        group_destroy(g);
+        compose_free(&doc);
+        return false;
+    }
+
+    bool ok = true;
+    for (int i = 0; i < doc.count && ok; ++i) {
+        ComposeMember *m = &doc.members[i];
         OverlayConfig cfg;
         memset(&cfg, 0, sizeof(cfg));
-        cfg.path = scan.items[i].media;
-        cfg.script = scan.items[i].script;
-        cfg.scale_pct = 100;
-        cfg.key_tolerance = 16;
-        Overlay *o = overlay_create(&cfg, false, created);
-        if (!o) continue;
+        cfg.path = m->media;
+        cfg.script = m->script;
+        cfg.x = m->x;
+        cfg.y = m->y;
+        cfg.scale_pct = m->scale_pct;
+        cfg.paused = m->paused;
+        cfg.topmost = m->topmost;
+        cfg.locked = m->locked;
+        cfg.clickthrough = m->clickthrough;
+        cfg.hidden = m->hidden;
+        cfg.key_enabled = m->key_enabled;
+        cfg.key_rgb = m->key_rgb;
+        cfg.key_tolerance = m->key_tolerance;
+        cfg.defer_script = true;
+        Overlay *o = overlay_create(&cfg, m->has_position, i);
+        if (!o) {
+            if (err) _snwprintf_s(err, cap, _TRUNCATE, TXT_GROUP_ERR_LOAD);
+            ok = false;
+            break;
+        }
         Overlay **tail = &g_app.overlays;
         while (*tail) tail = &(*tail)->next;
         *tail = o;
         o->group = g;
         o->uid = app_uid_alloc();
         overlay_announce(o, true);
-        ++created;
+        created[i] = o;
     }
-    group_scan_free(&scan);
-    if (created == 0) {
-        group_destroy(g);
-        if (err) _snwprintf_s(err, cap, _TRUNCATE, TXT_GROUP_ERR_LOAD);
+
+    for (int i = 0; i < doc.count && ok; ++i) {
+        int leader = doc.members[i].leader_index;
+        if (leader < 0) continue;
+        if (!overlay_bind_leader(created[i], created[leader], err, cap)) {
+            ok = false;
+            break;
+        }
+    }
+
+    if (ok) {
+        for (int i = 0; i < doc.count; ++i) {
+            Overlay *o = created[i];
+            if (!o->leader && o->script_spec && *o->script_spec)
+                overlay_set_script(o, o->script_spec);
+        }
+        char u8[MAX_PATH * 4];
+        log_info("group imported from compose: %s (%d member(s))",
+                 applog_u8(g->folder, u8, sizeof(u8)), doc.count);
+        overlay_refresh_hook();
+        app_changed();
+    } else {
+        rollback_group(g);
+    }
+
+    free(created);
+    compose_free(&doc);
+    return ok;
+}
+
+bool group_create_template(const wchar_t *path, wchar_t *err, size_t cap)
+{
+    if (err && cap) err[0] = 0;
+    const wchar_t *fname = wcsrchr(path, L'\\');
+    fname = fname ? fname + 1 : path;
+    const wchar_t *ext = wcsrchr(fname, L'.');
+    if (!ext || _wcsicmp(ext, L".compose") != 0) {
+        if (err) _snwprintf_s(err, cap, _TRUNCATE, TXT_GROUP_ERR_COMPOSE);
         return false;
     }
-    char u8[MAX_PATH * 4];
-    log_info("group imported: %s (%d member(s))", applog_u8(g->folder, u8, sizeof(u8)), created);
-    overlay_refresh_hook();
-    app_changed();
+
+    static const char TEMPLATE[] =
+        "# YAGP 分组 compose 模板\n"
+        "#\n"
+        "# 1. 把这个文件放在分组素材所在目录；\n"
+        "# 2. 把 media / script 改成实际文件名；路径相对本文件所在目录；\n"
+        "# 3. 托盘 →“分组”→“导入分组…”，选择这个 .compose 文件。\n"
+        "#\n"
+        "# 只允许一层 leader/follower：有 leader 的成员不能再拥有 follower。\n"
+        "# 未列在 members 中的文件不会导入。\n"
+        "\n"
+        "version: 1\n"
+        "name: my-group\n"
+        "\n"
+        "members:\n"
+        "  - media: pet.gif\n"
+        "    script: pet.lua\n"
+        "    # position: [200, 200]\n"
+        "    # scale: 100\n"
+        "    # paused: false        # 仅 GIF；静态图不能暂停\n"
+        "    # hidden: false\n"
+        "    # topmost: false\n"
+        "    # locked: false\n"
+        "    # clickthrough: false\n"
+        "    # key:\n"
+        "    #   enabled: false\n"
+        "    #   color: '#00FF00'\n"
+        "    #   tolerance: 16\n"
+        "\n"
+        "  # 需要 leader/follower 时取消下面的注释，并让 leader 指向上面的 media：\n"
+        "  # - media: follower.png\n"
+        "  #   script: follower.lua\n"
+        "  #   leader: pet.gif\n";
+
+    HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        log_warn("cannot create compose template (error %lu)", (unsigned long)GetLastError());
+        if (err) _snwprintf_s(err, cap, _TRUNCATE, TXT_GROUP_ERR_WRITE);
+        return false;
+    }
+    DWORD len = (DWORD)strlen(TEMPLATE);
+    DWORD written = 0;
+    BOOL ok = WriteFile(h, TEMPLATE, len, &written, NULL);
+    CloseHandle(h);
+    if (!ok || written != len) {
+        DeleteFileW(path);
+        log_warn("cannot write compose template (error %lu)", (unsigned long)GetLastError());
+        if (err) _snwprintf_s(err, cap, _TRUNCATE, TXT_GROUP_ERR_WRITE);
+        return false;
+    }
     return true;
 }

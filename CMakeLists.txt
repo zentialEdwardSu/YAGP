@@ -85,12 +85,25 @@ target_include_directories(rxilog PUBLIC ${rxilog_SOURCE_DIR}/src)
 target_compile_definitions(rxilog PRIVATE _CRT_SECURE_NO_WARNINGS)
 target_compile_options(rxilog PRIVATE /W0)
 
+# libyaml 0.2.5 (MIT): strict group manifest parser. The archive is pinned and
+# verified. Offline: -DFETCHCONTENT_SOURCE_DIR_YAML=<dir with CMakeLists.txt>.
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "libyaml requires an old policy minimum" FORCE)
+FetchContent_Declare(yaml
+    URL "https://github.com/yaml/libyaml/archive/refs/tags/0.2.5.tar.gz"
+    URL_HASH SHA256=FA240DBF262BE053F3898006D502D514936C818E422AFDCF33921C63BED9BF2E
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build static libraries" FORCE)
+FetchContent_MakeAvailable(yaml)
+if(TARGET yaml)
+    target_compile_options(yaml PRIVATE /W0)
+endif()
+
 # stb_image v2.30 is vendored under third_party/ (MIT/public domain): still
 # PNG/JPG/JPEG decoding only; giflib remains the animated-GIF decoder.
 
 add_executable(yagp WIN32
     main.c overlay.c clip.c clip_path.c config.c cursor_hook.c dialogs.c gif_stream.c frame_cache.c
-    still_image.c stb_image.c group.c
+    still_image.c stb_image.c group.c compose.c
     applog.c dx11_renderer.cpp input_fsm.c monitors.c script.c contacts.c transform.c presets.rc app.manifest)
 target_include_directories(yagp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
 set_source_files_properties(stb_image.c PROPERTIES COMPILE_OPTIONS "/W0")
@@ -107,7 +120,7 @@ endif()
 
 target_compile_definitions(yagp PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX
     _WIN32_WINNT=0x0A00 WINVER=0x0A00 ${YAGP_LANG_DEFINE})
-target_link_libraries(yagp PRIVATE giflib lua rxilog
+target_link_libraries(yagp PRIVATE giflib lua rxilog yaml
     user32 gdi32 shell32 shcore comdlg32 ole32 advapi32 d3d11 dxgi dcomp)
 target_compile_options(yagp PRIVATE /W4 /utf-8 /GS /guard:cf
     $<$<COMPILE_LANGUAGE:CXX>:/GR->)
@@ -143,12 +156,19 @@ target_compile_definitions(config_test PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_W
 target_compile_options(config_test PRIVATE /W4 /utf-8)
 target_link_libraries(config_test PRIVATE rxilog shell32 ole32)
 
-# Group folder scanner regression test (overlay/app stubs live in the test).
-add_executable(group_test EXCLUDE_FROM_ALL tests/group_test.c group.c applog.c)
+# Group compose parser/import regression test (overlay/app stubs in the test).
+add_executable(group_test EXCLUDE_FROM_ALL tests/group_test.c group.c compose.c applog.c)
 target_include_directories(group_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_definitions(group_test PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
 target_compile_options(group_test PRIVATE /W4 /utf-8)
-target_link_libraries(group_test PRIVATE giflib rxilog)
+target_link_libraries(group_test PRIVATE giflib rxilog yaml)
+
+# Compose schema/parser regression test.
+add_executable(compose_test EXCLUDE_FROM_ALL tests/compose_test.c compose.c)
+target_include_directories(compose_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(compose_test PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
+target_compile_options(compose_test PRIVATE /W4 /utf-8)
+target_link_libraries(compose_test PRIVATE yaml)
 
 # File-output regression test for applog.c: build/log_test.exe. The smaller cap
 # lets the test reach the session limit without writing 16 MB.

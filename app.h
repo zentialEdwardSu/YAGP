@@ -54,11 +54,12 @@ void app_modal_begin(void);
 void app_modal_end(void);
 /* Shows a popup menu owned by the tray window and returns the chosen command (0 = none). */
 UINT app_track_menu(HMENU menu, int x, int y);
-typedef enum PickKind { PICK_ADD, PICK_REPLACE, PICK_SCRIPT, PICK_NEW_SCRIPT, PICK_LOG_DIR, PICK_GROUP } PickKind;
+typedef enum PickKind { PICK_ADD, PICK_REPLACE, PICK_SCRIPT, PICK_NEW_SCRIPT, PICK_LOG_DIR, PICK_GROUP, PICK_GROUP_CREATE } PickKind;
 /* Opens the file dialog in a helper process and returns immediately. Results
  * arrive later: PICK_ADD adds every chosen file, PICK_REPLACE replaces target,
  * PICK_SCRIPT binds the chosen .lua file to target, PICK_LOG_DIR enables
- * logging in the chosen folder. */
+ * logging in the chosen folder. PICK_GROUP_CREATE saves a template compose
+ * file to the chosen path. */
 void app_pick_files(PickKind kind, Overlay *target);
 /* Save dialog in the helper process: writes the built-in preset `resource`
  * (RCDATA name) to the chosen file, opens it in an editor, and binds it to
