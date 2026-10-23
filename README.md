@@ -10,13 +10,13 @@ YAGP把 GIF 动画显示成无边框、背景透明的桌面挂件，不占任�
 
 ## 编译
 
-需要 Windows 10/11、Visual Studio 2022 及以上（MSVC）、CMake 3.25 及以上。giflib 5.2.2、Lua 5.4.7 和 rxi/log.c（均为 MIT 许可）在配置阶段通过 `FetchContent` 下载，并校验 SHA-256（log.c 固定到提交 `f9ea349`）。离线编译时传入 `-DFETCHCONTENT_SOURCE_DIR_GIFLIB=<目录>`、`-DFETCHCONTENT_SOURCE_DIR_LUA=<目录>` 和 `-DFETCHCONTENT_SOURCE_DIR_RXILOG=<含 src/log.c 的目录>`。stb_image v2.30 以单头文件内置在 `third_party/stb_image.h`（MIT/公共领域），不需要下载。
+需要 Windows 10/11、Visual Studio 2022 及以上（MSVC）、CMake 3.25 及以上。giflib 5.2.2、Lua 5.4.7、rxi/log.c 和 libyaml 0.2.5（均为 MIT 许可）在配置阶段通过 `FetchContent` 下载，并校验 SHA-256（log.c 固定到提交 `f9ea349`）。离线编译时传入 `-DFETCHCONTENT_SOURCE_DIR_GIFLIB=<目录>`、`-DFETCHCONTENT_SOURCE_DIR_LUA=<目录>`、`-DFETCHCONTENT_SOURCE_DIR_RXILOG=<含 src/log.c 的目录>` 和 `-DFETCHCONTENT_SOURCE_DIR_YAML=<目录>`。stb_image v2.30 以单头文件内置在 `third_party/stb_image.h`（MIT/公共领域），不需要下载。
 
 在任意终端里执行即可，不需要 VS 开发者终端：
 
 ```powershell
 cmake --preset release            # Visual Studio 生成器，x64，输出到 out\
-cmake --build --preset release    # 编译 yagp、script_test、log_test、gif_dump、image_dump、group_test、config_test
+cmake --build --preset release    # 编译 yagp、script_test、log_test、gif_dump、image_dump、group_test、compose_test、config_test
 .\out\Release\yagp.exe [file.gif ...]
 ```
 
@@ -43,18 +43,18 @@ python tools/make_icon.py    # 需要 Pillow；改脚本里的 RADIUS 可调整�
 ## 使用
 
 - 托盘图标（左键或右键）：添加媒体（GIF/PNG/JPG，可多选）、每个媒体的子菜单、分组、全部暂停/继续、开机自启动、删除配置数据、退出。绑定了运动脚本的 GIF 在托盘菜单里会标上"(运动)"。
-- 右键媒体：暂停/继续、更换媒体、缩放、色键抠图、运动脚本、从属关系、置顶、锁定位置、鼠标穿透、移到屏幕中央、隐藏、删除。
+- 右键媒体：暂停/继续、更换媒体、缩放、色键抠图、运动脚本、领导者关系、置顶、锁定位置、鼠标穿透、移到屏幕中央、隐藏、删除。
 - 隐藏：媒体从屏幕上消失，但不会被删除，仍保留在托盘菜单里（标为"(已隐藏)"），在它的子菜单里点"显示"即可恢复，位置、缩放、色键和脚本都不变。隐藏期间不播放、不运行脚本，其他脚本也看不到它，并会释放交换链和画布内存。隐藏状态会保存，重启后仍是隐藏的。
-- 图片：添加/替换/分组导入支持 `.png`、`.jpg`、`.jpeg`。PNG 保留 alpha，JPEG 按不透明处理；静态图没有动画，暂停/继续、seek、clip、播放速度等播放控制不可用，但移动、缩放、变换、透明度、色键、脚本、隐藏和主从控制仍然可用。APNG 只显示第一帧；不支持 WebP/AVIF 动画。
-- 分组：托盘"分组 → 导入分组…"选择一个文件夹，递归扫描其中**同目录同名**的媒体与 `.lua`（如 `pet.gif` + `pet.lua`、`cat.png` + `cat.lua`），未配对的文件当作 clip 素材忽略。每个分组一个托盘子菜单，可以隐藏/显示整组或移除整组；组隐藏不会覆盖成员自己的隐藏状态。
-- 主从：右键媒体 →"从属于…"选择一个主，一个主可以带多个从，只允许一层、不能成环。从的脚本不执行但保留绑定；解除主从后恢复。主的脚本通过 `yagp.followers()`/`yagp.follower(id)` 获取链式从 handle，控制从的移动、播放、变换、输入和可见性。
+- 图片：添加/替换/分组导入支持 `.png`、`.jpg`、`.jpeg`。PNG 保留 alpha，JPEG 按不透明处理；静态图没有动画，暂停/继续、seek、clip、播放速度等播放控制不可用，但移动、缩放、变换、透明度、色键、脚本、隐藏和领导者控制仍然可用。APNG 只显示第一帧；不支持 WebP/AVIF 动画。
+- 分组：托盘"分组 → 导入分组…"选择一个 `.compose` 文件（不能选文件夹），用 YAML 声明成员、脚本、位置、属性以及 leader/follower 关系。没有 `.compose` 文件无法导入。同一菜单里的"创建分组…"会打开保存对话框，生成一个带注释的 `yagp.compose` 模板；填写后再导入。每个分组一个托盘子菜单，可以隐藏/显示整组或移除整组；组隐藏不会覆盖成员自己的隐藏状态。模板也见 `example/yagp.compose.sample`。
+- leader/follower：在成员菜单中选择“领导者…”，一个 leader 可以带多个 follower，只允许一层、不能成环。follower 的脚本不执行但保留绑定；解除关系后恢复。leader 的脚本通过 `yagp.followers()`/`yagp.follower(id)` 获取链式 follower handle；也可以直接用 `.compose` 导入自动绑定。
 - 缩放：5% 到 250% 的滑块，实时预览。也可以直接输入数值，或点 100% 按钮。方向键每次 1%，PgUp/PgDn 每次 25%。取消会恢复原尺寸。缩放时 GIF 的中心点保持不动。
 - 色键抠图：输入十六进制颜色（`#00FF00`、`00ff00`、`#0F0`）和每通道容差（0–255，默认 16），或者直接取第一帧左上角像素的颜色。匹配的像素在合成时变为透明。
 - 未锁定时，可以用鼠标左键拖动 GIF。
 - 开启鼠标穿透的 GIF 不响应鼠标，可以在托盘菜单里对应 GIF 的子菜单中关闭。
 - 再次运行 `yagp.exe file.gif` 会把文件添加到已经在运行的实例中。
 - "开机自启动"会写入 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\YAGP`（仅当前用户，不需要管理员权限）。只有当这一项指向当前运行的 exe 时才显示为勾选。开机启动时不弹通知。
-- 状态保存在 `%APPDATA%\YAGP\config.txt`（1 秒防抖，退出时也会保存），包括每个媒体的脚本、分组和主从关系。配置格式为 v4，旧版 v1–v3 会自动读取。"删除配置数据"会删除 `%APPDATA%\YAGP`、`%LOCALAPPDATA%\YAGP` 中的帧缓存和开机自启动项，之后直到下次启动都不再保存。你自己的 `.lua` 文件不会被删除。
+- 状态保存在 `%APPDATA%\YAGP\config.txt`（1 秒防抖，退出时也会保存），包括每个媒体的脚本、分组和领导者/跟随者关系。配置格式为 v4，旧版 v1–v3 会自动读取。"删除配置数据"会删除 `%APPDATA%\YAGP`、`%LOCALAPPDATA%\YAGP` 中的帧缓存和开机自启动项，之后直到下次启动都不再保存。你自己的 `.lua` 文件不会被删除。
 - "启用日志记录…"会让你选一个文件夹，日志追加到 `<文件夹>\yagp-YYYYMMDD.log`。再次点击"停止日志记录"会写入最后一行并关闭文件。开关和文件夹都只在本次运行有效，不会保存，每次启用都要重新选择。启用期间跨过午夜时，后续日志写入同一文件夹下新日期的文件。每次启用最多写 16 MB，达到后自动停止并弹出托盘通知。日志措辞固定为英文；文件名、路径和脚本消息按原样以 UTF-8 字节保存。
 
 ### 从终端运行
@@ -77,10 +77,30 @@ python tools/make_icon.py    # 需要 Pillow；改脚本里的 RADIUS 可调整�
 `example/` 下有新特性的独立 demo：
 
 - `example/image/`：PNG/JPG 静态图、alpha/hitbox、移动/变换、播放控制禁用
-- `example/leader-follower/`：主从链式控制（需要手动右键绑定）
-- `example/group/`：分组导入、组隐藏/显示/移除、成员自身隐藏交互
+- `example/leader-follower/`：通过 `yagp.compose` 自动绑定，或手动从菜单中选择领导者
+- `example/group/`：通过 `.compose` 导入、组隐藏/显示/移除、成员自身隐藏交互
+- `example/yagp.compose.sample`：带完整注释的填写模板
 
 详见 [example/README.md](example/README.md)。
+
+### 分组 compose
+
+分组导入只接受 `.compose` 文件。文件放在分组目录中，成员路径相对该目录：
+
+```yaml
+version: 1
+name: my-group
+members:
+  - media: leader.gif
+    script: leader.lua
+    position: [200, 200]
+    topmost: true
+  - media: follower.png
+    script: follower.lua
+    leader: leader.gif
+```
+
+`media` 必需，`script` 可选；还支持 `scale`、`paused`（仅 GIF）、`hidden`、`topmost`、`locked`、`clickthrough`、`key`。未列出的文件不会导入；follower 的 `leader` 指向另一个成员的 `media`，只允许一层且不能成环。完整注释模板见 [example/yagp.compose.sample](example/yagp.compose.sample)。
 
 ## 运动脚本
 
@@ -138,26 +158,32 @@ python tools/make_icon.py    # 需要 Pillow；改脚本里的 RADIUS 可调整�
 | `yagp.set_rate(hz)` | 每秒调用 `update` 的次数，1–144，默认 60 |
 | `yagp.name` | GIF 文件名 |
 | `yagp.id` | 这个 GIF 的编号，本次运行内唯一，重启后会变 |
-| `yagp.others()` | 其他所有媒体：`{ {id, name, x, y, w, h, hx, hy, hw, hh, cx, cy, vx, vy, scripted, paused, still, controlled, leader, leader_id}, ... }`，包括没有脚本和已暂停的。`x, y, w, h` 是窗口，`hx, hy, hw, hh` 是可见区域，`cx, cy` 是可见区域的中心。`vx`、`vy` 是上一次 tick 的速度（像素/秒），不在运动时为 0。`still` 表示静态图，`controlled` 表示是从，`leader` 表示有从 |
+| `yagp.others()` | 其他所有媒体：`{ {id, name, x, y, w, h, hx, hy, hw, hh, cx, cy, vx, vy, scripted, paused, still, follower, leader, leader_id}, ... }`，包括没有脚本和已暂停的。`x, y, w, h` 是窗口，`hx, hy, hw, hh` 是可见区域，`cx, cy` 是可见区域的中心。`vx`、`vy` 是上一次 tick 的速度（像素/秒），不在运动时为 0。`still` 表示静态图，`follower` 表示是从，`leader` 表示有从 |
 | `yagp.peer(id)` | 某一个 GIF 的信息表，不存在时为 nil |
 | `yagp.overlaps([x, y [, w, h]])` | 可见区域与自己重叠的其他 GIF 列表。不传参数时按当前位置算，传 x、y 时按窗口移到那里算，显式传 w、h 时用 x、y 处的这个矩形。只是边贴着边不算重叠 |
 | `log.trace(...)`、`log.debug(...)`、`log.info(...)`、`log.warn(...)`、`log.error(...)`、`log.fatal(...)` | 写一行带 `script <名称>#<id>` 标识的日志。参数不调用元方法，用制表符连接；超长消息保留 1024 字节并追加 `...`。每个脚本每秒最多 100 行，超出部分丢弃并汇总 |
 | `yagp.notify(text)`、`yagp.notify(title, text)` | 显示托盘气泡（标题默认 `YAGP`）。显示成功返回 `true`；因频率限制（每个脚本 3 秒一次）或宿主不可用而抑制时返回 `false`。参数转换规则同 `log.*`，并按托盘字段截断 |
-| `yagp.followers()` | 当前媒体控制的直接从 handle 数组；不是主时为空 |
-| `yagp.follower(id)` | 指定 id 的从 handle；不是自己的从或不存在时为 nil |
-| `follower:pos()`、`size()`、`center()`、`hitbox()`、`frame()`、`clip_info(name)`、`name()`、`id()`、`paused()`、`hidden()` | 查询从的状态；从已删除时返回 nil |
+| `yagp.followers()` | 当前媒体控制的直接从 handle 数组；不是 leader 时为空 |
+| `yagp.follower(id)` | 指定 id 的从 handle；不是自己的 follower 或不存在时为 nil |
+| `yagp.set_locked(bool)`、`yagp.set_topmost(bool)` | 当前媒体本次运行的锁定/置顶覆盖；不写入配置，脚本重载后恢复菜单设置 |
+| `yagp.hide()`、`yagp.show()` | 隐藏/显示当前媒体；会保存。隐藏后脚本停止，需要托盘菜单再显示 |
+| `yagp.set_paused(bool)` | 暂停/继续当前 GIF 并保存；静态图返回 `nil, err` |
+| `follower:set_locked(bool)`、`follower:set_topmost(bool)` | 对 follower 设置本次运行的锁定/置顶覆盖，返回 handle |
+| `follower:pos()`、`size()`、`center()`、`hitbox()`、`frame()`、`clip_info(name)`、`name()`、`id()`、`paused()`、`hidden()` | 查询 follower 的状态；从已删除时返回 nil |
 | `follower:set_pos(...)`、`move(...)`、`set_flip(...)`、`set_hitbox(...)` | 移动/翻转/命中区域，返回同一个 handle |
-| `follower:clip(...)`、`unload(...)`、`play(...)`、`seek(...)`、`set_speed(...)`、`set_playing(...)`、`set_paused(...)` | 从的 GIF 播放控制，返回 handle；失败返回 nil, err。静态图上的这些方法返回"没有动画" |
-| `follower:set_matrix(...)`、`set_transform(...)`、`reset_transform(...)`、`set_opacity(...)` | 从的变换/透明度，返回 handle |
-| `follower:set_cursor(...)`、`set_draggable(...)`、`set_clickthrough(...)`、`hide()`、`show()` | 从的输入/可见性，返回 handle |
+| `follower:clip(...)`、`unload(...)`、`play(...)`、`seek(...)`、`set_speed(...)`、`set_playing(...)`、`set_paused(...)` | follower 的 GIF 播放控制，返回 handle；失败返回 nil, err。静态图上的这些方法返回"没有动画" |
+| `follower:set_matrix(...)`、`set_transform(...)`、`reset_transform(...)`、`set_opacity(...)` | follower 的变换/透明度，返回 handle |
+| `follower:set_cursor(...)`、`set_draggable(...)`、`set_clickthrough(...)`、`hide()`、`show()` | follower 的输入/可见性，返回 handle |
 
-从的脚本不执行；主不能删除从、更换从的文件、修改从的脚本绑定或主从关系。链式调用示例：
+`set_locked`、`set_topmost`、`set_clickthrough`、`set_draggable` 只影响本次运行，不写入配置。托盘菜单按有效状态显示勾选；用户从菜单修改时会清除脚本覆盖，脚本重载后恢复菜单设置。`hide/show` 和 `set_paused` 直接修改持久状态。
+
+follower 的脚本不执行；leader 不能删除 follower、更换 follower 的文件、修改 follower 的脚本绑定或领导者关系。链式调用示例：
 
 ```lua
 yagp.follower(id):set_pos(x, y):set_flip(true):play("walk", {loop = true}):set_opacity(0.5, 0.2)
 ```
 
-其他 GIF 的信息是只读的；只有通过主从关系绑定到自己的从才能被控制。最多能看到 64 个其他 GIF。
+其他 GIF 的信息是只读的；只有通过领导者/跟随者关系绑定到自己的 follower 才能被控制。最多能看到 64 个其他 GIF。
 
 **可见区域（hitbox）**：边缘检测和碰撞不看整个窗口，而是看 GIF 的可见区域，也就是所有帧里不透明像素的外接矩形（考虑色键）。它在建立帧缓存时顺带算出，运行时没有额外开销。`fits`、`overlaps`、`center`、`monitor`、`mouse().over`、`on_collide` 和所有预设都用它，所以带大片透明边的 GIF 会让可见部分贴着屏幕边缘和其他 GIF 反弹，透明的部分可以伸出屏幕。`yagp.pos`、`size`、`set_pos` 仍然指整个窗口。全透明的 GIF 用整个窗口。如果自动算出的区域不合适（比如有一圈不想参与碰撞的淡阴影），可以在脚本里用 `yagp.set_hitbox` 指定；更换脚本或 GIF 后会恢复自动。
 
@@ -242,12 +268,13 @@ python tests/test_gif_stream.py out\Release\gif_dump.exe   # 需要 Pillow
 python tests/test_frame_cache.py out\Release\gif_dump.exe
 python tests/test_still_image.py out\Release\image_dump.exe
 out\Release\group_test.exe
+out\Release\compose_test.exe
 out\Release\config_test.exe
 out\Release\script_test.exe
 out\Release\log_test.exe
 ```
 
-静态图测试用 Pillow 生成 PNG/JPEG，检查 alpha、色键、命中区域、JPEG 解码、损坏文件和尺寸超限拒绝；`script_test` 覆盖主从链式 handle、删除后安全失效和静态从的动画接口拒绝。
+静态图测试用 Pillow 生成 PNG/JPEG，检查 alpha、色键、命中区域、JPEG 解码、损坏文件和尺寸超限拒绝；`script_test` 覆盖 leader/follower 链式 handle、删除后安全失效和静态 follower 的动画接口拒绝。
 
 解码测试把合成后的帧和帧延时与 Pillow 的结果对比，覆盖 disposal 1/2/3、隔行扫描、用 `gif_stream_restart` 循环、色键，以及拒绝格式错误的十六进制颜色。它还会把每个用例解码到缩小的画布（一半、五分之一、奇数尺寸 37×29、1×1），与原尺寸参考帧按"取中心最近像素"采样的结果逐像素对比。
 
@@ -275,8 +302,8 @@ out\Release\log_test.exe
 - 日志只能在每次运行时从托盘启用（没有级别选择，也不保存日志路径），固定措辞为英文；路径和消息保留原始字节。
 - 终端日志只在带 `--verbose`/`-v` 启动时输出；没有控制台宿主（资源管理器、部分 Git Bash/pty）时只能靠重定向句柄或 DebugView。
 - 静态图没有动画；APNG 只显示第一帧，不支持 WebP/AVIF 动画。图片解码在 UI 线程完成，超大图受 64M 像素预算限制。
-- 分组只导入同目录同名配对的媒体与 `.lua`；没有同名脚本的 GIF/图片会被当作 clip 素材跳过。分组没有 tab 窗口，也没有成员重命名/手工增删。
-- 主从只允许一层；从不能同时是主，主不能变成从。从的脚本在主从期间不执行，解除或主被删除后才恢复。
+- 分组只能通过 `.compose` 文件导入；成员、脚本、属性和 leader/follower 关系都由该文件声明，未列出的文件被忽略。分组没有 tab 窗口，也没有成员重命名/手工增删。
+- leader/follower 只允许一层；follower 不能同时是 leader，leader 不能变成 follower。follower 的脚本在关系期间不执行，解除或 leader 被删除后才恢复。
 
 ## 许可
 
@@ -289,6 +316,7 @@ YAGP 以 MIT 许可证发布，完整文本见 [LICENSE](LICENSE)。
 | [giflib](https://giflib.sourceforge.net/) | 5.2.2 | MIT（Copyright © 1997 Eric S. Raymond） | GIF/LZW 解码 |
 | [Lua](https://www.lua.org/) | 5.4.7 | MIT（Copyright © 1994–2024 Lua.org, PUC-Rio） | 沙箱脚本运行时；`lstrlib.c` 的模式匹配工作量补丁仍属 Lua |
 | [rxi/log.c](https://github.com/rxi/log.c) | commit `f9ea349` | MIT（Copyright © 2020 rxi） | 日志核心 |
+| [libyaml](https://github.com/yaml/libyaml) | 0.2.5 | MIT（Copyright © 2017-2020 Ingy döt Net；2006-2016 Kirill Simonov） | `.compose` YAML 解析 |
 | [stb_image](https://github.com/nothings/stb) | v2.30（`third_party/stb_image.h`） | MIT / 公共领域（本项目采用 MIT） | PNG/JPG/JPEG 静态图解码 |
 
 完整第三方许可证文本见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。CMake、Python、Pillow 和 Visual Studio/MSVC 只用于构建和测试，不会被链接进 `yagp.exe`，也不随二进制分发。

@@ -18,20 +18,20 @@ default build shows the same entries in Chinese.
 
 ## Build
 
-Windows 10/11, Visual Studio 2022+ (MSVC), CMake 3.25+. giflib 5.2.2, Lua 5.4.7
-and rxi/log.c (all MIT) are pulled in by `FetchContent` at configure time
-(SHA-256 pinned; log.c is pinned to commit `f9ea349`). For offline builds pass
+Windows 10/11, Visual Studio 2022+ (MSVC), CMake 3.25+. giflib 5.2.2, Lua 5.4.7,
+rxi/log.c and libyaml 0.2.5 (all MIT) are pulled in by `FetchContent` at configure
+time (SHA-256 pinned; log.c is pinned to commit `f9ea349`). For offline builds pass
 `-DFETCHCONTENT_SOURCE_DIR_GIFLIB=<dir>`,
-`-DFETCHCONTENT_SOURCE_DIR_LUA=<dir>` and
-`-DFETCHCONTENT_SOURCE_DIR_RXILOG=<dir containing src/log.c>`. stb_image v2.30
-is vendored as `third_party/stb_image.h` (MIT/public domain) and needs no
-download.
+`-DFETCHCONTENT_SOURCE_DIR_LUA=<dir>`,
+`-DFETCHCONTENT_SOURCE_DIR_RXILOG=<dir containing src/log.c>` and
+`-DFETCHCONTENT_SOURCE_DIR_YAML=<dir>`. stb_image v2.30 is vendored as
+`third_party/stb_image.h` (MIT/public domain) and needs no download.
 
 From any shell (no VS developer prompt needed):
 
 ```powershell
 cmake --preset release            # Visual Studio generator, x64, into out\
-cmake --build --preset release    # yagp, script_test, log_test, gif_dump, image_dump, group_test, config_test
+cmake --build --preset release    # yagp, script_test, log_test, gif_dump, image_dump, group_test, compose_test, config_test
 .\out\Release\yagp.exe [file.gif ...]
 ```
 
@@ -75,16 +75,19 @@ python tools/make_icon.py    # needs Pillow; edit RADIUS in the script to change
   transforms, opacity, colour key, scripts, hiding and leader/follower control
   remain available. APNG is shown as its first frame; animated WebP/AVIF is not
   supported.
-- Groups: tray "Groups → Import group…" picks a folder and recursively scans
-  for same-directory, same-stem media + `.lua` pairs (`pet.gif` + `pet.lua`,
-  `cat.png` + `cat.lua`). Unpaired media are treated as clip assets. Each group
-  gets a tray submenu with hide/show and remove; group hiding does not overwrite
-  members' own hidden flags.
-- Leader/follower: right-click media → "Belongs to…" to choose one leader. A
+- Groups: tray "Groups → Import group…" selects a `.compose` file (not a
+  folder). The YAML declares members, scripts, positions, attributes and
+  leader/follower relations; a folder without a compose file cannot be imported.
+  "Create group…" in the same menu opens a save dialog and writes a commented
+  `yagp.compose` template. Each group gets a tray submenu with hide/show and
+  remove; group hiding does not overwrite members' own hidden flags. See also
+  `example/yagp.compose.sample`.
+- Leader/follower: right-click media → "Leader…" to choose one leader. A
   leader may have multiple followers, only one level is allowed and cycles are
   rejected. A follower's script is stopped but its binding is preserved; unlinking
   or removing the leader restores it. The leader script controls followers through
-  the chainable `yagp.followers()` / `yagp.follower(id)` handles.
+  the chainable `yagp.followers()` / `yagp.follower(id)` handles. A `.compose`
+  group can bind the relation automatically.
 - Hide takes media off the screen without removing it. It stays in the tray
   menu (tagged "(hidden)"); "Show" in its submenu brings it back with the same
   position, scale, colour key and script. While hidden it does not animate or
@@ -144,11 +147,36 @@ Redirected output is UTF-8; a console is written with `WriteConsoleW`.
 
 - `example/image/`: PNG/JPG still images, alpha/hitbox, movement/transforms,
   disabled playback controls
-- `example/leader-follower/`: chainable leader/follower control (manual menu binding)
-- `example/group/`: group import, group hide/show/remove, individual-vs-group
+- `example/leader-follower/`: `.compose` auto-binding or manual leader menu
+- `example/group/`: `.compose` import, group hide/show/remove, individual-vs-group
   hiding
+- `example/yagp.compose.sample`: commented fill-in template
 
 See [example/README.md](example/README.md).
+
+### Group compose
+
+Group import accepts only `.compose` files. The file lives in the group folder
+and member paths are relative to it:
+
+```yaml
+version: 1
+name: my-group
+members:
+  - media: leader.gif
+    script: leader.lua
+    position: [200, 200]
+    topmost: true
+  - media: follower.png
+    script: follower.lua
+    leader: leader.gif
+```
+
+`media` is required and `script` is optional. `scale`, `paused` (GIF only),
+`hidden`, `topmost`, `locked`, `clickthrough` and `key` are supported. Unlisted
+files are ignored; a follower's `leader` points to another member's `media`, only
+one level is allowed and cycles are rejected. See the commented
+[example/yagp.compose.sample](example/yagp.compose.sample).
 
 ## Motion scripts
 
@@ -220,18 +248,27 @@ above the primary monitor). Positions refer to the window's top-left corner.
 | `yagp.set_rate(hz)` | `update` calls per second, 1-144, default 60 |
 | `yagp.name` | GIF file name |
 | `yagp.id` | This GIF's id, unique for this run (changes on restart) |
-| `yagp.others()` | Every other media: `{ {id, name, x, y, w, h, hx, hy, hw, hh, cx, cy, vx, vy, scripted, paused, still, controlled, leader, leader_id}, ... }`, including ones without a script and paused ones. `x, y, w, h` is the window, `hx, hy, hw, hh` the visible area, `cx, cy` its centre. `vx`, `vy` are px/s over its last tick, 0 when not moving. `still` marks images, `controlled` marks followers, `leader` marks overlays with followers |
+| `yagp.others()` | Every other media: `{ {id, name, x, y, w, h, hx, hy, hw, hh, cx, cy, vx, vy, scripted, paused, still, follower, leader, leader_id}, ... }`, including ones without a script and paused ones. `x, y, w, h` is the window, `hx, hy, hw, hh` the visible area, `cx, cy` its centre. `vx`, `vy` are px/s over its last tick, 0 when not moving. `still` marks images, `follower` marks followers, `leader` marks overlays with followers |
 | `yagp.peer(id)` | One GIF's peer table, or nil |
 | `yagp.overlaps([x, y [, w, h]])` | Other GIFs whose visible area overlaps this GIF's. No arguments: where it is now; x, y: with the window moved there; explicit w, h: that rect at x, y. Sharing an edge is not an overlap |
 | `log.trace(...)`, `log.debug(...)`, `log.info(...)`, `log.warn(...)`, `log.error(...)`, `log.fatal(...)` | Write a log line tagged `script <name>#<id>`. Arguments are converted without metamethods and joined with tabs; long messages keep 1024 bytes and a `...` marker. At most 100 lines per second per script; the excess is dropped and summarised |
 | `yagp.notify(text)`, `yagp.notify(title, text)` | Show a tray balloon (default title `YAGP`). Returns `true` if it was shown, `false` when throttled (at most one per 3 s per script) or unavailable. Values are converted like `log.*`; the tray field limits are applied |
 | `yagp.followers()` | Array of chainable handles for this overlay's direct followers; empty when it is not a leader |
 | `yagp.follower(id)` | Handle for one direct follower, or nil |
+| `yagp.set_locked(bool)`, `yagp.set_topmost(bool)` | Runtime lock/topmost override for this media; not saved and cleared when the script reloads |
+| `yagp.hide()`, `yagp.show()` | Hide/show this media; persisted. Hiding stops the script, so use the tray menu to show it again |
+| `yagp.set_paused(bool)` | Pause/resume this GIF; persisted. Still images return nil, err |
+| `follower:set_locked(bool)`, `follower:set_topmost(bool)` | Runtime override on the follower; returns the handle |
 | `follower:pos()`, `size()`, `center()`, `hitbox()`, `frame()`, `clip_info(name)`, `name()`, `id()`, `paused()`, `hidden()` | Query follower state; nil after the follower is gone |
 | `follower:set_pos(...)`, `move(...)`, `set_flip(...)`, `set_hitbox(...)` | Move/flip/hitbox; returns the same handle |
 | `follower:clip(...)`, `unload(...)`, `play(...)`, `seek(...)`, `set_speed(...)`, `set_playing(...)`, `set_paused(...)` | Follower GIF playback; returns the handle, or nil, err on failure. On still images these return "no animation" |
 | `follower:set_matrix(...)`, `set_transform(...)`, `reset_transform(...)`, `set_opacity(...)` | Follower transform/opacity; returns the handle |
 | `follower:set_cursor(...)`, `set_draggable(...)`, `set_clickthrough(...)`, `hide()`, `show()` | Follower input/visibility; returns the handle |
+
+`set_locked`, `set_topmost`, `set_clickthrough` and `set_draggable` affect this run
+only and are not saved. The tray menu shows the effective state; a user menu
+choice clears the script override, and reloading the script restores the menu
+settings. `hide/show` and `set_paused` modify persisted state directly.
 
 A follower's own script is stopped; the leader cannot remove followers, replace their
 files, change their script binding or change the relation. Chain example:
@@ -408,6 +445,7 @@ python tests/test_gif_stream.py out\Release\gif_dump.exe   # needs Pillow
 python tests/test_frame_cache.py out\Release\gif_dump.exe
 python tests/test_still_image.py out\Release\image_dump.exe
 out\Release\group_test.exe
+out\Release\compose_test.exe
 out\Release\config_test.exe
 out\Release\script_test.exe
 out\Release\log_test.exe
@@ -466,9 +504,9 @@ the user's profile.
 - Still images have no animation; APNG shows its first frame and animated
   WebP/AVIF is not supported. Image decoding runs on the UI thread and is
   bounded by a 64M-pixel budget.
-- Groups import only same-directory, same-stem media + `.lua` pairs; unpaired
-  media are treated as clip assets. There is no tab window and no manual
-  member rename/add/remove.
+- Groups are imported only from a `.compose` file. The file lists members and
+  exposes media/script paths; unlisted files are ignored. There is no tab window
+  and no manual member rename/add/remove.
 - Leader/follower is one level only: a follower cannot be a leader and a leader cannot
   become a follower. A follower's script stays stopped while bound and resumes after
   unlinking or when its leader is removed.
@@ -485,6 +523,7 @@ text.
 | [giflib](https://giflib.sourceforge.net/) | 5.2.2 | MIT (Copyright (c) 1997 Eric S. Raymond) | GIF/LZW decoding |
 | [Lua](https://www.lua.org/) | 5.4.7 | MIT (Copyright (c) 1994-2024 Lua.org, PUC-Rio) | Sandboxed scripting runtime; the `lstrlib.c` pattern-work patch remains under the Lua license |
 | [rxi/log.c](https://github.com/rxi/log.c) | commit `f9ea349` | MIT (Copyright (c) 2020 rxi) | Logging core |
+| [libyaml](https://github.com/yaml/libyaml) | 0.2.5 | MIT (Copyright (c) 2017-2020 Ingy döt Net; 2006-2016 Kirill Simonov) | `.compose` YAML parsing |
 | [stb_image](https://github.com/nothings/stb) | v2.30 (`third_party/stb_image.h`) | MIT / public domain (MIT chosen) | PNG/JPG/JPEG decoding |
 
 The complete third-party license texts are in
